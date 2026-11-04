@@ -156,7 +156,10 @@ where
         server,
         sessions: Mutex::new(HashMap::new()),
         client_caps: Mutex::new(acp::ClientCapabilities::default()),
-        default_mode: config.default_mode.unwrap_or_else(|| "agent".to_string()),
+        default_mode: config
+            .default_mode
+            .filter(|m| session::find_mode(m).is_some())
+            .unwrap_or_else(|| "agent".to_string()),
     });
     let serve = async move {
         server2.handshake(&handshake_cfg).await.map_err(err)?;
@@ -373,10 +376,15 @@ async fn authenticate(
                 .await
                 .map_err(err)?;
         }
-        "chat-gpt" | "chat-gpt-device-code" => {
+        method @ ("chat-gpt" | "chat-gpt-device-code") => {
+            let login_type = if method == "chat-gpt-device-code" {
+                "chatgptDeviceCode"
+            } else {
+                "chatgpt"
+            };
             let resp: Value = bridge
                 .server
-                .call("account/login/start", &json!({"type": "chatgpt"}))
+                .call("account/login/start", &json!({"type": login_type}))
                 .await
                 .map_err(err)?;
             let url = resp
@@ -385,6 +393,7 @@ async fn authenticate(
                 .unwrap_or_default();
             let login_id = resp.get("loginId").cloned().unwrap_or(Value::Null);
             tracing::info!(%url, "chatgpt login url");
+            let meta = json!({"authUrl": url});
             let rx = bridge.server.global_events();
             loop {
                 let ev = rx
@@ -397,7 +406,9 @@ async fn authenticate(
                     let raw = serde_json::to_value(&n).unwrap_or_default();
                     if login_id.is_null() || raw.get("loginId") == Some(&login_id) {
                         if raw.get("success").and_then(Value::as_bool).unwrap_or(true) {
-                            return r.respond(acp::AuthenticateResponse::new());
+                            return r.respond(
+                                acp::AuthenticateResponse::new().meta(meta.as_object().cloned()),
+                            );
                         }
                         return Err(AcpError::internal_error().data("login failed"));
                     }
@@ -428,10 +439,26 @@ fn mcp_config(servers: &[acp::McpServer]) -> Value {
                 );
             }
             acp::McpServer::Http(http) => {
-                map.insert(http.name.clone(), json!({"url": http.url}));
+                let headers: serde_json::Map<String, Value> = http
+                    .headers
+                    .iter()
+                    .map(|h| (h.name.clone(), Value::from(h.value.clone())))
+                    .collect();
+                map.insert(
+                    http.name.clone(),
+                    json!({"url": http.url, "headers": headers}),
+                );
             }
             acp::McpServer::Sse(sse) => {
-                map.insert(sse.name.clone(), json!({"url": sse.url}));
+                let headers: serde_json::Map<String, Value> = sse
+                    .headers
+                    .iter()
+                    .map(|h| (h.name.clone(), Value::from(h.value.clone())))
+                    .collect();
+                map.insert(
+                    sse.name.clone(),
+                    json!({"url": sse.url, "headers": headers}),
+                );
             }
             _ => {}
         }
@@ -455,16 +482,12 @@ async fn new_session(
                 "approvalPolicy": mode.approval_policy,
                 "approvalsReviewer": mode.approvals_reviewer,
                 "sandbox": mode.sandbox_mode,
-                "sandboxPolicy": mode.sandbox_policy,
                 "config": mcp_config(&req.mcp_servers),
             }),
         )
         .await
         .map_err(err)?;
-    let thread_id = serde_json::to_value(&resp.thread)
-        .ok()
-        .and_then(|t| t.get("id").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_default();
+    let thread_id = resp.thread.id.clone();
     let events = bridge.server.subscribe(thread_id.clone()).await;
     let s = Session::new(
         thread_id,
@@ -568,6 +591,8 @@ async fn resume_thread(
     cwd: &std::path::Path,
     mcp_servers: &[acp::McpServer],
 ) -> Result<Arc<Session>, AcpError> {
+    // Subscribe before resuming: events can start streaming immediately.
+    let events = bridge.server.subscribe(thread_id.to_string()).await;
     let resp: Value = bridge
         .server
         .call(
@@ -580,7 +605,6 @@ async fn resume_thread(
         )
         .await
         .map_err(err)?;
-    let events = bridge.server.subscribe(thread_id.to_string()).await;
     let s = Session::new(
         thread_id.to_string(),
         cwd.to_path_buf(),
@@ -673,9 +697,13 @@ async fn replay_history(
                     send_update(conn, session_id, translate::thought_delta(text));
                 }
                 Some(_) => {
-                    if let Some(u) =
+                    let status = payload.get("status").and_then(Value::as_str);
+                    let update = if matches!(status, Some("completed" | "failed" | "declined")) {
+                        translate::item_completed_update(payload)
+                    } else {
                         translate::item_as_tool_call(payload, acp::ToolCallStatus::Pending)
-                    {
+                    };
+                    if let Some(u) = update {
                         send_update(conn, session_id, u);
                     }
                 }
@@ -787,6 +815,19 @@ async fn close_session(
     r: sdk::v1::Responder<acp::CloseSessionResponse>,
 ) -> Result<(), AcpError> {
     let id = req.session_id.0.to_string();
+    let session = bridge.sessions.lock().await.get(&id).cloned();
+    if let Some(s) = session {
+        let turn = s.active_turn.lock().await.clone();
+        if let Some(turn_id) = turn {
+            let _ = bridge
+                .server
+                .call::<_, Value>(
+                    "turn/interrupt",
+                    &json!({"threadId": s.thread_id, "turnId": turn_id}),
+                )
+                .await;
+        }
+    }
     let _ = bridge
         .server
         .call::<_, Value>("thread/unsubscribe", &json!({"threadId": id}))
@@ -823,14 +864,17 @@ fn prompt_input(prompt: &[acp::ContentBlock], cwd: &std::path::Path) -> Vec<Valu
                 "type": "image",
                 "url": format!("data:{};base64,{}", i.mime_type, i.data),
             })),
-            acp::ContentBlock::ResourceLink(l) => input.push(json!({
-                "type": "mention",
-                "name": l.name,
-                "path": l.uri.strip_prefix("file://").map_or_else(
-                    || cwd.join(&l.uri).to_string_lossy().to_string(),
-                    str::to_string,
-                ),
-            })),
+            acp::ContentBlock::ResourceLink(l) => {
+                if let Some(path) = l.uri.strip_prefix("file://") {
+                    input.push(json!({
+                        "type": "mention",
+                        "name": l.name,
+                        "path": path,
+                    }));
+                } else {
+                    let _ = cwd;
+                }
+            }
             acp::ContentBlock::Resource(res) => {
                 if let acp::EmbeddedResourceResource::TextResourceContents(t) = &res.resource {
                     input.push(json!({"type": "text", "text": t.text}));
@@ -838,8 +882,7 @@ fn prompt_input(prompt: &[acp::ContentBlock], cwd: &std::path::Path) -> Vec<Valu
             }
             acp::ContentBlock::Audio(a) => input.push(json!({
                 "type": "audio",
-                "data": a.data,
-                "format": a.mime_type,
+                "url": format!("data:{};base64,{}", a.mime_type, a.data),
             })),
             _ => {}
         }
@@ -882,7 +925,7 @@ async fn prompt(
                 "cwd": session.cwd.to_string_lossy(),
                 "model": model,
                 "effort": effort,
-                "serviceTier": fast.then_some("fast"),
+                "serviceTierForTurn": fast.then_some("fast"),
                 "approvalPolicy": mode.approval_policy,
                 "approvalsReviewer": mode.approvals_reviewer,
                 "sandboxPolicy": mode.sandbox_policy,
@@ -912,6 +955,15 @@ async fn run_turn(
     conn: &Conn,
 ) -> Result<acp::StopReason, AcpError> {
     let turn_id = session.active_turn.lock().await.clone().unwrap_or_default();
+    // Stale cancels from between turns must not kill a fresh turn.
+    while session.cancel_rx.try_recv().is_ok() {}
+    let notices_ok = bridge
+        .client_caps
+        .lock()
+        .await
+        .session
+        .as_ref()
+        .is_some_and(|s| s.notices.is_some());
     loop {
         let ev = futures_lite::future::or(
             async { session.events.recv().await.map(EventOrCancel::Event) },
@@ -940,7 +992,7 @@ async fn run_turn(
         };
         match ev {
             AppEvent::Notification(n) => {
-                if let Some(stop) = forward_notification(&n, session, conn) {
+                if let Some(stop) = forward_notification(&n, session, conn, notices_ok) {
                     return Ok(stop);
                 }
             }
@@ -964,9 +1016,21 @@ fn forward_notification(
     n: &codex_codes::Notification,
     session: &Arc<Session>,
     conn: &Conn,
+    notices_ok: bool,
 ) -> Option<acp::StopReason> {
     use codex_codes::Notification as N;
     let sid = &session.id;
+    // Skip turn-scoped leftovers from another turn.
+    if let Some(tid) = n.turn_id() {
+        let active = session
+            .active_turn
+            .try_lock()
+            .map(|g| g.clone().unwrap_or_default())
+            .unwrap_or_default();
+        if !tid.is_empty() && tid != active {
+            return None;
+        }
+    }
     match n {
         N::AgentMessageDelta(d) => send_update(conn, sid, translate::agent_delta(&d.delta)),
         N::ReasoningDelta(d) => {
@@ -1010,29 +1074,38 @@ fn forward_notification(
         }
         N::TurnCompleted(n) => {
             let v = serde_json::to_value(&n.turn).unwrap_or_default();
+            let completed_id = v.get("id").and_then(Value::as_str).unwrap_or_default();
+            let active = session
+                .active_turn
+                .try_lock()
+                .map(|g| g.clone().unwrap_or_default())
+                .unwrap_or_default();
+            if !completed_id.is_empty() && completed_id != active {
+                return None;
+            }
             return Some(translate::stop_reason(&v));
         }
         N::ThreadTokenUsageUpdated(n) => {
             let v = serde_json::to_value(&n.token_usage).unwrap_or_default();
             send_update(conn, sid, translate::usage_update(&v));
         }
-        N::Error(e) => {
+        N::Error(e) if notices_ok => {
             let v = serde_json::to_value(e).unwrap_or_default();
             send_update(conn, sid, notice(acp::NoticeSeverity::Error, &v));
         }
-        N::Warning(e) => {
+        N::Warning(e) if notices_ok => {
             let v = serde_json::to_value(e).unwrap_or_default();
             send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v));
         }
-        N::ConfigWarning(e) => {
+        N::ConfigWarning(e) if notices_ok => {
             let v = serde_json::to_value(e).unwrap_or_default();
             send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v));
         }
-        N::GuardianWarning(e) => {
+        N::GuardianWarning(e) if notices_ok => {
             let v = serde_json::to_value(e).unwrap_or_default();
             send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v));
         }
-        N::ContextCompacted(n) => {
+        N::ContextCompacted(n) if notices_ok => {
             let v = serde_json::to_value(n).unwrap_or_default();
             send_update(
                 conn,
@@ -1416,6 +1489,17 @@ async fn run_command(
             *session.active_turn.lock().await = None;
             r.respond(acp::PromptResponse::new(stop))
         }
-        _ => r.respond(acp::PromptResponse::new(acp::StopReason::EndTurn)),
+        _ => {
+            send_update(
+                conn,
+                &session.id,
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new(format!(
+                        "Unknown command: /{name}"
+                    ))),
+                )),
+            );
+            r.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
+        }
     }
 }
