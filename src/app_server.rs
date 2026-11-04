@@ -98,21 +98,16 @@ pub struct AppServer {
 }
 
 impl AppServer {
-    /// Attach to an already-connected pair of app-server streams and run the
-    /// `initialize` handshake.
+    /// Attach to an already-connected pair of app-server streams.
     ///
-    /// The returned future must be driven to pump inbound frames into the
-    /// demultiplexer; when it finishes the connection is dead.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the `initialize` handshake is refused.
-    #[allow(clippy::result_large_err)]
-    pub async fn attach<R, W>(
+    /// The returned future must be polled to pump inbound frames into the
+    /// demultiplexer — and must be running for [`Self::handshake`] and any
+    /// request to resolve, since replies only arrive through it. When it
+    /// finishes the connection is dead.
+    pub fn attach<R, W>(
         read: R,
         write: W,
-        handshake: &SpawnConfig,
-    ) -> Result<(Arc<Self>, impl Future<Output = ()> + Send), Error>
+    ) -> (Arc<Self>, impl Future<Output = ()> + Send + use<R, W>)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -140,8 +135,7 @@ impl AppServer {
                 futures_lite::future::or(reader, consume).await;
             }
         };
-        server.handshake(handshake).await?;
-        Ok((server, demux))
+        (server, demux)
     }
 
     /// Spawn `codex app-server` and attach to it.
@@ -158,7 +152,7 @@ impl AppServer {
     #[cfg(feature = "process")]
     pub async fn spawn(
         config: &SpawnConfig,
-    ) -> Result<(Arc<Self>, impl Future<Output = ()> + Send), Error> {
+    ) -> Result<(Arc<Self>, impl Future<Output = ()> + Send + use<>), Error> {
         let path = config
             .codex_path
             .clone()
@@ -174,13 +168,21 @@ impl AppServer {
         let mut child = cmd.spawn().map_err(Error::Spawn)?;
         let stdout = child.stdout.take().expect("stdout piped");
         let stdin = child.stdin.take().expect("stdin piped");
-        let (server, demux) = Self::attach(stdout, stdin, config).await?;
+        let (server, demux) = Self::attach(stdout, stdin);
         *server.child.lock().await = Some(child);
         Ok((server, demux))
     }
 
-    #[allow(clippy::result_large_err)]
-    async fn handshake(&self, config: &SpawnConfig) -> Result<(), Error> {
+    /// Perform the `initialize`/`initialized` handshake.
+    ///
+    /// The drive future returned by [`Self::attach`]/[`Self::spawn`] must be
+    /// polled concurrently for this to resolve.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the peer refuses or the connection drops mid-handshake.
+    #[allow(clippy::result_large_err, clippy::future_not_send)]
+    pub async fn handshake(&self, config: &SpawnConfig) -> Result<(), Error> {
         let params = serde_json::json!({
             "clientInfo": {
                 "name": config.client_name,
