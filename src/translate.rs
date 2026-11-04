@@ -138,6 +138,9 @@ fn diff_content(p: &Value) -> Option<Vec<acp::ToolCallContent>> {
 #[must_use]
 pub fn item_completed_update(item: &Value) -> Option<acp::SessionUpdate> {
     let p = payload(item);
+    if !TOOL_ITEMS.contains(&p.get("type").and_then(Value::as_str)?) {
+        return None;
+    }
     let id = item_id(item)?;
     let status = p
         .get("status")
@@ -150,6 +153,7 @@ pub fn item_completed_update(item: &Value) -> Option<acp::SessionUpdate> {
     if let Some(out) = p
         .get("aggregatedOutput")
         .or_else(|| p.get("output"))
+        .or_else(|| p.get("result"))
         .cloned()
     {
         fields = fields.raw_output(out);
@@ -202,7 +206,6 @@ pub fn patch_update(item_id: &str, changes: &[Value]) -> acp::SessionUpdate {
 pub fn stop_reason(turn: &Value) -> acp::StopReason {
     match turn.get("status").and_then(Value::as_str) {
         Some("interrupted") => acp::StopReason::Cancelled,
-        Some("failed") => acp::StopReason::Refusal,
         _ => acp::StopReason::EndTurn,
     }
 }
@@ -212,6 +215,7 @@ pub fn stop_reason(turn: &Value) -> acp::StopReason {
 pub fn usage_update(token_usage: &Value) -> acp::SessionUpdate {
     let used = token_usage
         .get("total")
+        .and_then(|t| t.get("totalTokens"))
         .or_else(|| token_usage.get("totalTokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -221,4 +225,82 @@ pub fn usage_update(token_usage: &Value) -> acp::SessionUpdate {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(used, size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::v1::schema::{SessionUpdate, ToolCallStatus, ToolKind};
+
+    #[test]
+    fn usage_reads_total_total_tokens() {
+        let usage = serde_json::json!({
+            "last": {"inputTokens": 3, "outputTokens": 1, "totalTokens": 4},
+            "total": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12},
+            "modelContextWindow": 272_000,
+        });
+        let SessionUpdate::UsageUpdate(u) = usage_update(&usage) else {
+            panic!("expected usage update")
+        };
+        assert_eq!(u.used, 12);
+        assert_eq!(u.size, 272_000);
+    }
+
+    #[test]
+    fn completed_non_tool_items_emit_nothing() {
+        for item in [
+            serde_json::json!({"type": "agentMessage", "id": "m1", "text": "hi"}),
+            serde_json::json!({"type": "reasoning", "id": "r1", "summary": ["s"]}),
+            serde_json::json!({"type": "userMessage", "id": "u1", "content": []}),
+            serde_json::json!({"type": "plan", "id": "p1", "text": "plan"}),
+        ] {
+            assert!(item_completed_update(&item).is_none(), "{item}");
+            assert!(item_as_tool_call(&item, ToolCallStatus::Completed).is_none());
+        }
+    }
+
+    #[test]
+    fn completed_tool_item_maps_status_and_output() {
+        let item = serde_json::json!({
+            "type": "commandExecution", "id": "e1", "command": "ls",
+            "status": "completed", "aggregatedOutput": "out",
+            "commandActions": [], "cwd": "/tmp",
+        });
+        let Some(SessionUpdate::ToolCallUpdate(u)) = item_completed_update(&item) else {
+            panic!("expected tool call update")
+        };
+        assert_eq!(u.tool_call_id.0.as_ref(), "e1");
+        assert_eq!(u.fields.status, Some(ToolCallStatus::Completed));
+        assert_eq!(u.fields.raw_output, Some(serde_json::json!("out")));
+    }
+
+    #[test]
+    fn tool_item_kinds_and_status() {
+        let started = serde_json::json!({
+            "type": "fileChange", "id": "f1", "changes": [], "status": "inProgress",
+        });
+        let Some(SessionUpdate::ToolCall(c)) =
+            item_as_tool_call(&started, ToolCallStatus::InProgress)
+        else {
+            panic!("expected tool call")
+        };
+        assert_eq!(c.kind, ToolKind::Edit);
+        assert_eq!(c.status, ToolCallStatus::InProgress);
+    }
+
+    #[test]
+    fn stop_reason_mapping() {
+        assert_eq!(
+            stop_reason(&serde_json::json!({"status": "interrupted"})),
+            acp::StopReason::Cancelled
+        );
+        assert_eq!(
+            stop_reason(&serde_json::json!({"status": "failed"})),
+            acp::StopReason::EndTurn
+        );
+        assert_eq!(
+            stop_reason(&serde_json::json!({"status": "completed"})),
+            acp::StopReason::EndTurn
+        );
+    }
 }

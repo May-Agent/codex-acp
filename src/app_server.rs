@@ -300,7 +300,10 @@ impl AppServer {
 
 /// Extract a `threadId` from a params object, if present.
 fn thread_id_of(params: &Value) -> Option<&str> {
-    params.get("threadId")?.as_str()
+    params
+        .get("threadId")
+        .or_else(|| params.get("conversationId"))?
+        .as_str()
 }
 
 async fn route(server: &AppServer, msg: Incoming) {
@@ -310,7 +313,11 @@ async fn route(server: &AppServer, msg: Incoming) {
             let frame = serde_json::json!({"method": method, "params": params});
             let event = match ServerMessage::from_value(frame.clone()) {
                 Ok(ServerMessage::Notification(n)) => AppEvent::Notification(n),
-                Ok(_) => unreachable!("a notification frame never decodes as a request"),
+                Ok(_) => AppEvent::Unknown {
+                    method: Some(method),
+                    params,
+                    id: None,
+                },
                 Err(err) => {
                     debug!(%err, "undecoded notification");
                     AppEvent::Unknown {
