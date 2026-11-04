@@ -1,0 +1,12 @@
+[workspace]
+pr_draft = false
+pr_labels = ["release"]
+git_release_name = "{{ package }}-v{{ version }}"
+publish = false
+git_tag_enable = true
+git_release_enable = true
+changelog_update = true
+
+[[package]]
+name = "codex-acp"
+git_tag_name = "v{{ version }}"
