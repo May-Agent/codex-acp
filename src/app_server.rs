@@ -19,6 +19,7 @@ use crate::jsonrpc::{Connection, Incoming, RemoteError};
 
 /// Errors the bridge can hit on the app-server side.
 #[derive(Debug, Error)]
+#[allow(clippy::result_large_err)]
 pub enum Error {
     /// Transport-level failure.
     #[error(transparent)]
@@ -39,6 +40,7 @@ pub enum Error {
 
 /// One app-server-originated event after demultiplexing.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum AppEvent {
     /// A server notification, decoded into the typed enum.
     Notification(codex_codes::Notification),
@@ -101,6 +103,11 @@ impl AppServer {
     ///
     /// The returned future must be driven to pump inbound frames into the
     /// demultiplexer; when it finishes the connection is dead.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the `initialize` handshake is refused.
+    #[allow(clippy::result_large_err)]
     pub async fn attach<R, W>(
         read: R,
         write: W,
@@ -138,6 +145,16 @@ impl AppServer {
     }
 
     /// Spawn `codex app-server` and attach to it.
+    ///
+    /// # Errors
+    ///
+    /// Fails to spawn or to complete the handshake.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the child's piped stdio is missing (cannot happen in
+    /// practice — it is configured right above).
+    #[allow(clippy::result_large_err)]
     #[cfg(feature = "process")]
     pub async fn spawn(
         config: &SpawnConfig,
@@ -162,6 +179,7 @@ impl AppServer {
         Ok((server, demux))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn handshake(&self, config: &SpawnConfig) -> Result<(), Error> {
         let params = serde_json::json!({
             "clientInfo": {
@@ -188,7 +206,8 @@ impl AppServer {
     /// # Errors
     ///
     /// Propagates connection errors and decode failures.
-    pub async fn call<P: Serialize, R: DeserializeOwned>(
+    #[allow(clippy::result_large_err, clippy::future_not_send)]
+    pub async fn call<P: Serialize + Sync, R: DeserializeOwned>(
         &self,
         method: &str,
         params: &P,
@@ -198,13 +217,23 @@ impl AppServer {
     }
 
     /// Send a notification.
-    pub async fn notify<P: Serialize>(&self, method: &str, params: &P) -> Result<(), Error> {
+    ///
+    /// # Errors
+    ///
+    /// Propagates write failures.
+    #[allow(clippy::result_large_err, clippy::future_not_send)]
+    pub async fn notify<P: Serialize + Sync>(&self, method: &str, params: &P) -> Result<(), Error> {
         self.conn.notify(method, params).await?;
         Ok(())
     }
 
     /// Answer a server request (approval, elicitation, ...).
-    pub async fn respond<P: Serialize>(&self, id: &Value, result: &P) -> Result<(), Error> {
+    ///
+    /// # Errors
+    ///
+    /// Propagates serialization/write failures.
+    #[allow(clippy::result_large_err, clippy::future_not_send)]
+    pub async fn respond<P: Serialize + Sync>(&self, id: &Value, result: &P) -> Result<(), Error> {
         self.conn
             .respond(id, Ok(serde_json::to_value(result)?))
             .await?;
@@ -212,6 +241,11 @@ impl AppServer {
     }
 
     /// Answer a server request with a JSON-RPC error.
+    ///
+    /// # Errors
+    ///
+    /// Propagates write failures.
+    #[allow(clippy::result_large_err, clippy::future_not_send)]
     pub async fn respond_error(
         &self,
         id: &Value,
@@ -236,6 +270,7 @@ impl AppServer {
     /// The thread id is known only after `thread/start` returns, so callers
     /// register it once the session is created. Events arriving before the
     /// subscription may be missed; subscribe right after the call resolves.
+    #[allow(clippy::future_not_send)]
     pub async fn subscribe(&self, thread_id: impl Into<String>) -> Receiver<AppEvent> {
         let (tx, rx) = async_channel::unbounded();
         self.subscribers.lock().await.insert(thread_id.into(), tx);
@@ -243,6 +278,7 @@ impl AppServer {
     }
 
     /// Drop a thread's subscription.
+    #[allow(clippy::future_not_send)]
     pub async fn unsubscribe(&self, thread_id: &str) {
         self.subscribers.lock().await.remove(thread_id);
     }

@@ -83,7 +83,7 @@ pub struct Connection<W> {
     next_id: AtomicU64,
 }
 
-impl<W: AsyncWrite + Unpin> Connection<W> {
+impl<W: AsyncWrite + Unpin + Send> Connection<W> {
     /// Build a connection over `read`/`write` halves.
     ///
     /// The returned future drives the reader; it finishes when the peer's
@@ -114,7 +114,11 @@ impl<W: AsyncWrite + Unpin> Connection<W> {
     /// [`Error::Remote`] when the peer answers with an error object,
     /// [`Error::Closed`] when the connection dies first, [`Error::Io`] on a
     /// write failure.
-    pub async fn request<P: Serialize>(&self, method: &str, params: &P) -> Result<Value, Error> {
+    pub async fn request<P: Serialize + Sync>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> Result<Value, Error> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let key = id.to_string();
         let (tx, rx) = async_channel::bounded(1);
@@ -160,7 +164,7 @@ impl<W: AsyncWrite + Unpin> Connection<W> {
     /// # Errors
     ///
     /// Propagates write failures.
-    pub async fn notify<P: Serialize>(&self, method: &str, params: &P) -> Result<(), Error> {
+    pub async fn notify<P: Serialize + Sync>(&self, method: &str, params: &P) -> Result<(), Error> {
         let frame = serde_json::json!({"method": method, "params": params});
         self.write_frame(&frame).await
     }
@@ -183,6 +187,7 @@ impl<W: AsyncWrite + Unpin> Connection<W> {
         let mut writer = self.writer.lock().await;
         writer.write_all(&line).await?;
         writer.flush().await?;
+        drop(writer);
         Ok(())
     }
 }
@@ -216,24 +221,27 @@ async fn dispatch(value: Value, events: &Sender<Incoming>, pending: &PendingMap)
     let id = obj.get("id").cloned();
     match (id, obj.contains_key("method")) {
         (Some(id), false) => {
-            let outcome = if let Some(err) = obj.get("error") {
-                Err(RemoteError {
-                    code: err.get("code").and_then(Value::as_i64).unwrap_or(-32603),
-                    message: err
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error")
-                        .to_string(),
-                    data: err.get("data").cloned(),
-                })
-            } else {
-                Ok(obj.get("result").cloned().unwrap_or(Value::Null))
-            };
-            if let Some(tx) = pending.lock().await.remove(&id.to_string()) {
-                let _ = tx.try_send(outcome);
-            } else {
-                debug!(?id, "dropping response for unknown request");
-            }
+            let outcome = obj.get("error").map_or_else(
+                || Ok(obj.get("result").cloned().unwrap_or(Value::Null)),
+                |err| {
+                    Err(RemoteError {
+                        code: err.get("code").and_then(Value::as_i64).unwrap_or(-32603),
+                        message: err
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error")
+                            .to_string(),
+                        data: err.get("data").cloned(),
+                    })
+                },
+            );
+            let tx = pending.lock().await.remove(&id.to_string());
+            tx.map_or_else(
+                || debug!(?id, "dropping response for unknown request"),
+                |tx| {
+                    let _ = tx.try_send(outcome);
+                },
+            );
         }
         (Some(id), true) => {
             let _ = events

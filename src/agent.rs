@@ -139,6 +139,7 @@ fn err(e: impl std::fmt::Display) -> AcpError {
 /// # Errors
 ///
 /// Propagates connection and protocol errors.
+#[allow(clippy::future_not_send, clippy::result_large_err)]
 pub async fn serve<T, D>(
     transport: T,
     server: Arc<AppServer>,
@@ -176,6 +177,7 @@ pub async fn serve_stdio(config: CodexAcpConfig) -> Result<(), AcpError> {
     serve(sdk::Stdio::new(), server, drive, config).await
 }
 
+#[allow(clippy::result_large_err, clippy::too_many_lines)]
 async fn serve_on<T: sdk::ConnectTo<Agent>>(
     transport: T,
     bridge: Arc<Bridge>,
@@ -344,6 +346,7 @@ fn initialize_response(version: sdk::schema::ProtocolVersion) -> acp::Initialize
         .agent_info(acp::Implementation::new("codex-acp", env!("CARGO_PKG_VERSION")).title("Codex"))
 }
 
+#[allow(clippy::result_large_err)]
 async fn authenticate(
     bridge: Arc<Bridge>,
     req: acp::AuthenticateRequest,
@@ -431,6 +434,7 @@ fn mcp_config(servers: &[acp::McpServer]) -> Value {
     json!({"mcp_servers": map})
 }
 
+#[allow(clippy::result_large_err)]
 async fn new_session(
     bridge: Arc<Bridge>,
     req: acp::NewSessionRequest,
@@ -480,6 +484,7 @@ async fn new_session(
     )
 }
 
+#[allow(clippy::result_large_err)]
 async fn list_sessions(
     bridge: Arc<Bridge>,
     req: acp::ListSessionsRequest,
@@ -551,6 +556,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// `thread/resume` + session registration shared by load/resume.
+#[allow(clippy::result_large_err)]
 async fn resume_thread(
     bridge: &Arc<Bridge>,
     thread_id: &str,
@@ -594,6 +600,7 @@ async fn resume_thread(
 }
 
 /// Replay stored thread items as session updates.
+#[allow(clippy::result_large_err)]
 async fn replay_history(
     bridge: &Arc<Bridge>,
     s: &Session,
@@ -642,15 +649,14 @@ async fn replay_history(
                         acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
                             acp::ContentBlock::Text(acp::TextContent::new(text)),
                         )),
-                    )
-                    .await;
+                    );
                 }
                 Some("agentMessage") => {
                     let text = payload
                         .get("text")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    send_update(conn, session_id, translate::agent_delta(text)).await;
+                    send_update(conn, session_id, translate::agent_delta(text));
                 }
                 Some("reasoning") => {
                     let text = payload
@@ -659,13 +665,13 @@ async fn replay_history(
                         .and_then(|s| s.first())
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    send_update(conn, session_id, translate::thought_delta(text)).await;
+                    send_update(conn, session_id, translate::thought_delta(text));
                 }
                 Some(_) => {
                     if let Some(u) =
                         translate::item_as_tool_call(payload, acp::ToolCallStatus::Pending)
                     {
-                        send_update(conn, session_id, u).await;
+                        send_update(conn, session_id, u);
                     }
                 }
                 None => {}
@@ -675,10 +681,11 @@ async fn replay_history(
     Ok(())
 }
 
-async fn send_update(conn: &Conn, session_id: &acp::SessionId, update: acp::SessionUpdate) {
+fn send_update(conn: &Conn, session_id: &acp::SessionId, update: acp::SessionUpdate) {
     let _ = conn.send_notification(acp::SessionNotification::new(session_id.clone(), update));
 }
 
+#[allow(clippy::result_large_err)]
 async fn load_session(
     bridge: Arc<Bridge>,
     req: acp::LoadSessionRequest,
@@ -702,6 +709,7 @@ async fn load_session(
     )
 }
 
+#[allow(clippy::result_large_err)]
 async fn resume_session(
     bridge: Arc<Bridge>,
     req: acp::ResumeSessionRequest,
@@ -723,6 +731,7 @@ async fn resume_session(
     )
 }
 
+#[allow(clippy::result_large_err)]
 async fn fork_session(
     bridge: Arc<Bridge>,
     req: acp::ForkSessionRequest,
@@ -766,6 +775,7 @@ async fn fork_session(
     )
 }
 
+#[allow(clippy::result_large_err)]
 async fn close_session(
     bridge: Arc<Bridge>,
     req: acp::CloseSessionRequest,
@@ -781,6 +791,7 @@ async fn close_session(
     r.respond(acp::CloseSessionResponse::new())
 }
 
+#[allow(clippy::result_large_err)]
 async fn delete_session(
     bridge: Arc<Bridge>,
     req: acp::DeleteSessionRequest,
@@ -840,6 +851,7 @@ fn slash_command(prompt: &[acp::ContentBlock]) -> Option<String> {
     }
 }
 
+#[allow(clippy::result_large_err, clippy::too_many_lines)]
 async fn prompt(
     bridge: Arc<Bridge>,
     req: acp::PromptRequest,
@@ -881,12 +893,14 @@ async fn prompt(
     r.respond(acp::PromptResponse::new(stop))
 }
 
+#[allow(clippy::large_enum_variant)]
 enum EventOrCancel {
     Event(AppEvent),
     Cancelled,
 }
 
 /// Consume session events until the turn ends; translate + forward them.
+#[allow(clippy::result_large_err)]
 async fn run_turn(
     bridge: &Arc<Bridge>,
     session: &Arc<Session>,
@@ -921,7 +935,7 @@ async fn run_turn(
         };
         match ev {
             AppEvent::Notification(n) => {
-                if let Some(stop) = forward_notification(&n, session, conn).await? {
+                if let Some(stop) = forward_notification(&n, session, conn) {
                     return Ok(stop);
                 }
             }
@@ -940,28 +954,29 @@ async fn run_turn(
 }
 
 /// Returns `Some(stop_reason)` when the turn finished.
-async fn forward_notification(
+#[allow(clippy::result_large_err)]
+fn forward_notification(
     n: &codex_codes::Notification,
     session: &Arc<Session>,
     conn: &Conn,
-) -> Result<Option<acp::StopReason>, AcpError> {
+) -> Option<acp::StopReason> {
     use codex_codes::Notification as N;
     let sid = &session.id;
     match n {
-        N::AgentMessageDelta(d) => send_update(conn, sid, translate::agent_delta(&d.delta)).await,
+        N::AgentMessageDelta(d) => send_update(conn, sid, translate::agent_delta(&d.delta)),
         N::ReasoningDelta(d) => {
-            send_update(conn, sid, translate::thought_delta(&d.delta)).await;
+            send_update(conn, sid, translate::thought_delta(&d.delta));
         }
         N::ReasoningTextDelta(d) => {
-            send_update(conn, sid, translate::thought_delta(&d.delta)).await;
+            send_update(conn, sid, translate::thought_delta(&d.delta));
         }
         N::CmdOutputDelta(d) => {
-            send_update(conn, sid, translate::output_delta(&d.item_id, &d.delta)).await;
+            send_update(conn, sid, translate::output_delta(&d.item_id, &d.delta));
         }
         N::FileChangeOutputDelta(d) => {
             let v = serde_json::to_value(d).unwrap_or_default();
             let delta = v.get("delta").and_then(Value::as_str).unwrap_or_default();
-            send_update(conn, sid, translate::output_delta(&d.item_id, delta)).await;
+            send_update(conn, sid, translate::output_delta(&d.item_id, delta));
         }
         N::FileChangePatchUpdated(d) => {
             let changes = serde_json::to_value(&d.changes).unwrap_or_default();
@@ -969,49 +984,48 @@ async fn forward_notification(
                 conn,
                 sid,
                 translate::patch_update(&d.item_id, changes.as_array().map_or(&[], Vec::as_slice)),
-            )
-            .await;
+            );
         }
         N::ItemStarted(n) => {
             let v = serde_json::to_value(&n.item).unwrap_or_default();
             if let Some(u) = translate::item_as_tool_call(&v, acp::ToolCallStatus::InProgress) {
-                send_update(conn, sid, u).await;
+                send_update(conn, sid, u);
             }
         }
         N::ItemCompleted(n) => {
             let v = serde_json::to_value(&n.item).unwrap_or_default();
             if let Some(u) = translate::item_completed_update(&v) {
-                send_update(conn, sid, u).await;
+                send_update(conn, sid, u);
             }
         }
-        N::PlanDelta(d) => send_update(conn, sid, translate::agent_delta(&d.delta)).await,
+        N::PlanDelta(d) => send_update(conn, sid, translate::agent_delta(&d.delta)),
         N::TurnPlanUpdated(d) => {
             let v = serde_json::to_value(d).unwrap_or_default();
-            send_update(conn, sid, plan_update(&v)).await;
+            send_update(conn, sid, plan_update(&v));
         }
         N::TurnCompleted(n) => {
             let v = serde_json::to_value(&n.turn).unwrap_or_default();
-            return Ok(Some(translate::stop_reason(&v)));
+            return Some(translate::stop_reason(&v));
         }
         N::ThreadTokenUsageUpdated(n) => {
             let v = serde_json::to_value(&n.token_usage).unwrap_or_default();
-            send_update(conn, sid, translate::usage_update(&v)).await;
+            send_update(conn, sid, translate::usage_update(&v));
         }
         N::Error(e) => {
             let v = serde_json::to_value(e).unwrap_or_default();
-            send_update(conn, sid, notice(acp::NoticeSeverity::Error, &v)).await;
+            send_update(conn, sid, notice(acp::NoticeSeverity::Error, &v));
         }
         N::Warning(e) => {
             let v = serde_json::to_value(e).unwrap_or_default();
-            send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v)).await;
+            send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v));
         }
         N::ConfigWarning(e) => {
             let v = serde_json::to_value(e).unwrap_or_default();
-            send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v)).await;
+            send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v));
         }
         N::GuardianWarning(e) => {
             let v = serde_json::to_value(e).unwrap_or_default();
-            send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v)).await;
+            send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v));
         }
         N::ContextCompacted(n) => {
             let v = serde_json::to_value(n).unwrap_or_default();
@@ -1022,12 +1036,11 @@ async fn forward_notification(
                     acp::Notice::new(acp::NoticeSeverity::Info, "Context compacted")
                         .description(v.get("turnId").and_then(Value::as_str).map(str::to_string)),
                 ),
-            )
-            .await;
+            );
         }
         _ => {}
     }
-    Ok(None)
+    None
 }
 
 fn plan_update(plan: &Value) -> acp::SessionUpdate {
@@ -1047,9 +1060,7 @@ fn plan_update(plan: &Value) -> acp::SessionUpdate {
                         acp::PlanEntryPriority::Medium,
                         match e.get("status").and_then(Value::as_str) {
                             Some("completed") => acp::PlanEntryStatus::Completed,
-                            Some("inProgress" | "in_progress") => {
-                                acp::PlanEntryStatus::InProgress
-                            }
+                            Some("inProgress" | "in_progress") => acp::PlanEntryStatus::InProgress,
                             _ => acp::PlanEntryStatus::Pending,
                         },
                     )
@@ -1204,6 +1215,7 @@ async fn ask(conn: &Conn, session_id: &acp::SessionId, title: &str, raw: &Value)
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn cancel(bridge: Arc<Bridge>, n: acp::CancelNotification) -> Result<(), AcpError> {
     if let Ok(s) = bridge.session(&n.session_id).await {
         let _ = s.cancel_tx.try_send(());
@@ -1211,6 +1223,7 @@ async fn cancel(bridge: Arc<Bridge>, n: acp::CancelNotification) -> Result<(), A
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 async fn set_mode(
     bridge: Arc<Bridge>,
     req: acp::SetSessionModeRequest,
@@ -1225,6 +1238,7 @@ async fn set_mode(
     r.respond(acp::SetSessionModeResponse::new())
 }
 
+#[allow(clippy::result_large_err)]
 async fn set_config_option(
     bridge: Arc<Bridge>,
     req: acp::SetSessionConfigOptionRequest,
@@ -1261,6 +1275,7 @@ async fn set_config_option(
 }
 
 /// `_`-prefixed extension methods, including the codex dialect's legacy names.
+#[allow(clippy::result_large_err)]
 async fn ext_request(
     bridge: Arc<Bridge>,
     req: sdk::UntypedMessage,
@@ -1291,7 +1306,8 @@ async fn ext_request(
                     .or_else(|| params.get("prompt"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if let Some(turn) = s.active_turn.lock().await.clone() {
+                let turn = s.active_turn.lock().await.clone();
+                if let Some(turn) = turn {
                     let _: Value = bridge
                         .server
                         .call(
@@ -1332,6 +1348,7 @@ async fn ext_request(
 }
 
 /// A `/`-command prompt: run the codex-side action and report as updates.
+#[allow(clippy::result_large_err)]
 async fn run_command(
     bridge: &Arc<Bridge>,
     session: &Arc<Session>,
@@ -1372,8 +1389,7 @@ async fn run_command(
                 acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
                     acp::ContentBlock::Text(acp::TextContent::new(format!("Account: {v}"))),
                 )),
-            )
-            .await;
+            );
             r.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
         }
         "review" | "review-branch" | "review-commit" => {
