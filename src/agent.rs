@@ -150,13 +150,18 @@ where
     T: sdk::ConnectTo<Agent>,
     D: Future<Output = ()> + Send,
 {
+    let handshake_cfg = config.spawn.clone();
+    let server2 = server.clone();
     let bridge = Arc::new(Bridge {
         server,
         sessions: Mutex::new(HashMap::new()),
         client_caps: Mutex::new(acp::ClientCapabilities::default()),
         default_mode: config.default_mode.unwrap_or_else(|| "agent".to_string()),
     });
-    let serve = serve_on(transport, bridge);
+    let serve = async move {
+        server2.handshake(&handshake_cfg).await.map_err(err)?;
+        serve_on(transport, bridge).await
+    };
     let driven = async move {
         drive.await;
         Ok(())
