@@ -10,8 +10,9 @@ Workspace hosting two runtime-agnostic Rust crates for driving OpenAI Codex:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo clippy -p codex-sdk --all-targets --no-default-features -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 cargo nextest run --workspace --all-features --no-tests=pass
+cargo nextest run --workspace --no-default-features --no-tests=pass
 cargo test --doc --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 cargo test --workspace --all-features -- --ignored   # live tests against `codex`

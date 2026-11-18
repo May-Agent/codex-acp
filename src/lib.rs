@@ -19,5 +19,7 @@ pub mod jsonrpc;
 pub mod session;
 pub mod translate;
 
-pub use agent::{CodexAcpConfig, serve, serve_stdio};
+#[cfg(feature = "process")]
+pub use agent::serve_stdio;
+pub use agent::{CodexAcpConfig, serve};
 pub use codex_sdk;

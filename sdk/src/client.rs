@@ -23,9 +23,9 @@ use codex_codes::{
     TurnStartParams, TurnStartResponse, TurnSteerParams, TurnSteerResponse, protocol::methods,
 };
 use futures_lite::future::{or, zip};
-use futures_lite::io::{AsyncRead, AsyncWrite};
 #[cfg(feature = "process")]
-use futures_lite::io::{AsyncReadExt, BufReader};
+use futures_lite::io::BufReader;
+use futures_lite::io::{AsyncRead, AsyncWrite};
 use futures_lite::stream::Stream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -153,6 +153,8 @@ struct DemuxState {
     subscribers: HashMap<String, Sender<ThreadEvent>>,
     early_buffers: HashMap<String, VecDeque<ThreadEvent>>,
     early_order: VecDeque<String>,
+    global_subscribers: Vec<Sender<ThreadEvent>>,
+    global_early: VecDeque<ThreadEvent>,
 }
 
 impl DemuxState {
@@ -162,6 +164,8 @@ impl DemuxState {
             subscribers: HashMap::new(),
             early_buffers: HashMap::new(),
             early_order: VecDeque::new(),
+            global_subscribers: Vec::new(),
+            global_early: VecDeque::new(),
         }
     }
 
@@ -177,6 +181,22 @@ impl DemuxState {
             tx.close();
         } else if let Some(prev) = self.subscribers.insert(thread_id, tx) {
             prev.close();
+        }
+        rx
+    }
+
+    fn subscribe_global(&mut self) -> Receiver<ThreadEvent> {
+        self.global_subscribers.retain(|tx| !tx.is_closed());
+        let (tx, rx) = async_channel::unbounded();
+        if self.global_subscribers.is_empty() {
+            for ev in self.global_early.drain(..) {
+                let _ = tx.try_send(ev);
+            }
+        }
+        if self.closed {
+            tx.close();
+        } else {
+            self.global_subscribers.push(tx);
         }
         rx
     }
@@ -217,6 +237,18 @@ impl DemuxState {
         queue.push_back(event);
     }
 
+    fn route_global_event(&mut self, event: ThreadEvent) {
+        self.global_subscribers
+            .retain(|tx| tx.try_send(event.clone()).is_ok());
+        if !self.global_subscribers.is_empty() || self.closed {
+            return;
+        }
+        if self.global_early.len() >= MAX_EARLY_EVENTS_PER_THREAD {
+            let _ = self.global_early.pop_front();
+        }
+        self.global_early.push_back(event);
+    }
+
     fn close_all(&mut self) {
         self.closed = true;
         for (_, tx) in self.subscribers.drain() {
@@ -224,14 +256,16 @@ impl DemuxState {
         }
         self.early_buffers.clear();
         self.early_order.clear();
+        for tx in self.global_subscribers.drain(..) {
+            tx.close();
+        }
+        self.global_early.clear();
     }
 }
 
 struct Inner {
     conn: Connection<Box<dyn AsyncWrite + Unpin + Send>>,
     demux: StdMutex<DemuxState>,
-    global_tx: Sender<ThreadEvent>,
-    global_rx: Receiver<ThreadEvent>,
     client_closed: AtomicBool,
     close_signal_tx: Sender<()>,
     has_child: bool,
@@ -249,7 +283,6 @@ impl Inner {
         if let Ok(mut demux) = self.demux.lock() {
             demux.close_all();
         }
-        self.global_tx.close();
     }
 
     fn route_notification(&self, method: String, params: Option<Value>) {
@@ -265,12 +298,12 @@ impl Inner {
             }
         };
 
-        if let Some(tid) = thread_id {
-            if let Ok(mut demux) = self.demux.lock() {
+        if let Ok(mut demux) = self.demux.lock() {
+            if let Some(tid) = thread_id {
                 demux.route_thread_event(tid, event);
+            } else {
+                demux.route_global_event(event);
             }
-        } else {
-            let _ = self.global_tx.try_send(event);
         }
     }
 
@@ -321,7 +354,6 @@ impl AppServer {
     {
         let boxed_write: Box<dyn AsyncWrite + Unpin + Send> = Box::new(write);
         let (conn, reader_fut) = Connection::new_deferred(read, boxed_write);
-        let (global_tx, global_rx) = async_channel::unbounded();
         let (close_signal_tx, close_signal_rx) = async_channel::bounded(1);
         let (exit_ready_tx, exit_ready_rx) = async_channel::bounded(1);
         exit_ready_tx.close();
@@ -329,8 +361,6 @@ impl AppServer {
         let inner = Arc::new(Inner {
             conn,
             demux: StdMutex::new(DemuxState::new()),
-            global_tx,
-            global_rx,
             client_closed: AtomicBool::new(false),
             close_signal_tx,
             has_child: false,
@@ -421,15 +451,12 @@ impl AppServer {
 
         let boxed_write: Box<dyn AsyncWrite + Unpin + Send> = Box::new(stdin);
         let (conn, reader_fut) = Connection::new_deferred(stdout, boxed_write);
-        let (global_tx, global_rx) = async_channel::unbounded();
         let (close_signal_tx, close_signal_rx) = async_channel::bounded(1);
         let (exit_ready_tx, exit_ready_rx) = async_channel::bounded(1);
 
         let inner = Arc::new(Inner {
             conn,
             demux: StdMutex::new(DemuxState::new()),
-            global_tx,
-            global_rx,
             client_closed: AtomicBool::new(false),
             close_signal_tx,
             has_child: true,
@@ -437,7 +464,6 @@ impl AppServer {
             exit_ready_rx,
         });
 
-        let events = inner.conn.events();
         let driver_inner = Arc::clone(&inner);
         let handler = Arc::new(handler);
 
@@ -445,14 +471,13 @@ impl AppServer {
             run_spawned_driver(
                 &mut child,
                 reader_fut,
-                events,
                 stderr,
                 handler,
                 &close_signal_rx,
+                &exit_ready_tx,
                 &driver_inner,
             )
             .await;
-            exit_ready_tx.close();
         };
 
         Ok((Self { inner }, driver))
@@ -538,11 +563,20 @@ impl AppServer {
         }
     }
 
-    /// Cloneable receiver for global notifications carrying no thread identifier
-    /// (account events, MCP startup updates, configuration warnings, etc.).
+    /// Subscribe to global notifications carrying no thread identifier (account
+    /// events, MCP startup updates, configuration warnings, etc.).
+    ///
+    /// Multiple subscribers each receive every global notification emitted
+    /// while their [`Receiver`] remains alive; while no subscriber is attached,
+    /// a bounded ring retains recent early notifications for the first subscriber.
     #[must_use]
     pub fn global_events(&self) -> Receiver<ThreadEvent> {
-        self.inner.global_rx.clone()
+        let Ok(mut demux) = self.inner.demux.lock() else {
+            let (tx, rx) = async_channel::unbounded();
+            tx.close();
+            return rx;
+        };
+        demux.subscribe_global()
     }
 
     /// Perform the `initialize` request followed by the `initialized`
@@ -966,172 +1000,144 @@ async fn dispatch_server_request<H: ServerRequestHandler>(
 async fn run_spawned_driver<ReadFut, H>(
     child: &mut async_process::Child,
     reader_fut: ReadFut,
-    events: Receiver<Incoming>,
     stderr: async_process::ChildStderr,
     handler: Arc<H>,
     close_signal_rx: &Receiver<()>,
+    exit_ready_tx: &Sender<()>,
     inner: &Arc<Inner>,
 ) where
     ReadFut: Future<Output = Result<()>> + Send,
     H: ServerRequestHandler,
 {
-    enum Phase {
-        ClosedByClient,
-        NaturalEnd { read_err: Option<SdkError> },
-    }
-
-    let mut stderr_collector = StderrCollector::new(drain_stderr(stderr));
-    let phase = {
+    let events = inner.conn.events();
+    let closed_by_client = {
         let io_pump = async {
-            let mut read_err = None;
-            let read_task = async {
-                if let Err(err) = reader_fut.await {
-                    read_err = Some(err);
+            let read_and_reap = async {
+                let mut stderr_drainer = StderrDrainer::new(stderr);
+                let read_res = {
+                    let mut read_pinned = std::pin::pin!(reader_fut);
+                    poll_fn(|cx| {
+                        if !stderr_drainer.is_terminated() {
+                            stderr_drainer.poll_drain(cx);
+                        }
+                        read_pinned.as_mut().poll(cx)
+                    })
+                    .await
+                };
+
+                if !inner.is_client_closed() {
+                    if read_res.is_err() {
+                        let _ = child.kill();
+                    }
+                    let status = {
+                        let mut status_fut = std::pin::pin!(child.status());
+                        poll_fn(|cx| {
+                            if !stderr_drainer.is_terminated() {
+                                stderr_drainer.poll_drain(cx);
+                            }
+                            status_fut.as_mut().poll(cx)
+                        })
+                        .await
+                        .ok()
+                    };
+                    let stderr_tail = stderr_drainer.into_tail();
+                    let record = if status.is_none_or(|s| !s.success()) {
+                        Some(ExitRecord {
+                            status,
+                            stderr: stderr_tail,
+                        })
+                    } else {
+                        None
+                    };
+                    let _ = inner.exit_record.set(record);
                 }
-                inner.conn.events().close();
+
+                // Wake any pending or re-entrant `ServerRequestHandler` RPC calls
+                // BEFORE `dispatch_task` finishes draining `in_flight`.
+                exit_ready_tx.close();
+                inner.conn.mark_closed();
             };
+
             let dispatch_task = drive_events(Arc::clone(inner), events, Arc::clone(&handler));
-            let _ = zip(read_task, dispatch_task).await;
-            Phase::NaturalEnd { read_err }
+            let _ = zip(read_and_reap, dispatch_task).await;
+            false
         };
 
-        let poll_io_and_stderr = async {
-            let mut io_pinned = Box::pin(io_pump);
-            poll_fn(|cx| {
-                // Keep draining stderr concurrently so the child never blocks
-                // on a full OS stderr pipe buffer while running.
-                if !stderr_collector.is_terminated() {
-                    stderr_collector.poll_drive(cx);
-                }
-                io_pinned.as_mut().poll(cx)
-            })
-            .await
-        };
-
-        or(poll_io_and_stderr, async {
+        or(io_pump, async {
             let _ = close_signal_rx.recv().await;
-            Phase::ClosedByClient
+            true
         })
         .await
     };
 
-    match phase {
-        Phase::ClosedByClient => {
-            let _ = inner.conn.close().await;
-            let _ = child.kill();
-            let _ = child.status().await;
-            let _ = inner.exit_record.set(None);
-            inner.finish_close();
-        }
-        Phase::NaturalEnd { read_err } => {
-            if inner.is_client_closed() {
-                let _ = inner.conn.close().await;
-                let _ = child.kill();
-                let _ = child.status().await;
-                let _ = inner.exit_record.set(None);
-                inner.finish_close();
-                return;
-            }
-            if read_err.is_some() {
-                let _ = child.kill();
-            }
-
-            let stderr_tail = or(stderr_collector.finish(), async {
-                let _ = close_signal_rx.recv().await;
-                String::new()
-            })
-            .await;
-
-            if inner.is_client_closed() {
-                let _ = child.kill();
-                let _ = child.status().await;
-                let _ = inner.exit_record.set(None);
-                inner.finish_close();
-                return;
-            }
-
-            let status = child.status().await.ok();
-            let record = if status.is_none_or(|s| !s.success()) {
-                Some(ExitRecord {
-                    status,
-                    stderr: stderr_tail,
-                })
-            } else {
-                None
-            };
-            let _ = inner.exit_record.set(record);
-            inner.finish_close();
-        }
+    if closed_by_client || inner.is_client_closed() {
+        let _ = inner.conn.close().await;
+        let _ = child.kill();
+        let _ = child.status().await;
+        let _ = inner.exit_record.set(None);
     }
+    exit_ready_tx.close();
+    inner.finish_close();
 }
 
 #[cfg(feature = "process")]
-struct StderrCollector<F> {
-    fut: Option<Pin<Box<F>>>,
-    output: Option<String>,
+struct StderrDrainer {
+    reader: Option<BufReader<async_process::ChildStderr>>,
+    raw: Vec<u8>,
 }
 
 #[cfg(feature = "process")]
-impl<F: Future<Output = String> + Send> StderrCollector<F> {
-    fn new(fut: F) -> Self {
+impl StderrDrainer {
+    fn new(stderr: async_process::ChildStderr) -> Self {
         Self {
-            fut: Some(Box::pin(fut)),
-            output: None,
+            reader: Some(BufReader::new(stderr)),
+            raw: Vec::new(),
         }
     }
 
     const fn is_terminated(&self) -> bool {
-        self.fut.is_none()
+        self.reader.is_none()
     }
 
-    fn poll_drive(&mut self, cx: &mut std::task::Context<'_>) {
-        if let Some(fut) = &mut self.fut
-            && let Poll::Ready(out) = fut.as_mut().poll(cx)
-        {
-            self.output = Some(out);
-            self.fut = None;
-        }
-    }
-
-    async fn finish(&mut self) -> String {
-        if let Some(out) = self.output.take() {
-            return out;
-        }
-        if let Some(fut) = self.fut.take() {
-            return fut.await;
-        }
-        String::new()
-    }
-}
-
-#[cfg(feature = "process")]
-async fn drain_stderr(stderr: async_process::ChildStderr) -> String {
-    let mut reader = BufReader::new(stderr);
-    let mut raw = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if let Ok(text) = std::str::from_utf8(&chunk[..n]) {
-                    for line in text.lines() {
-                        if !line.trim().is_empty() {
-                            debug!(target: "codex_sdk::stderr", "{line}");
+    fn poll_drain(&mut self, cx: &mut std::task::Context<'_>) {
+        let mut chunk = [0_u8; 4096];
+        while let Some(reader) = &mut self.reader {
+            match Pin::new(reader).poll_read(cx, &mut chunk) {
+                Poll::Ready(Ok(0) | Err(_)) => {
+                    self.reader = None;
+                }
+                Poll::Ready(Ok(n)) => {
+                    if let Ok(text) = std::str::from_utf8(&chunk[..n]) {
+                        for line in text.lines() {
+                            if !line.trim().is_empty() {
+                                debug!(target: "codex_sdk::stderr", "{line}");
+                            }
                         }
                     }
+                    self.raw.extend_from_slice(&chunk[..n]);
+                    if self.raw.len() > MAX_STDERR_TAIL_BYTES * 2 {
+                        let drain_to = self.raw.len() - MAX_STDERR_TAIL_BYTES;
+                        self.raw.drain(..drain_to);
+                    }
                 }
-                raw.extend_from_slice(&chunk[..n]);
-                if raw.len() > MAX_STDERR_TAIL_BYTES * 2 {
-                    let drain_to = raw.len() - MAX_STDERR_TAIL_BYTES;
-                    raw.drain(..drain_to);
-                }
+                Poll::Pending => break,
             }
         }
     }
-    if raw.len() > MAX_STDERR_TAIL_BYTES {
-        let start = raw.len() - MAX_STDERR_TAIL_BYTES;
-        String::from_utf8_lossy(&raw[start..]).into_owned()
-    } else {
-        String::from_utf8_lossy(&raw).into_owned()
+
+    fn drain_available_now(&mut self) {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        self.poll_drain(&mut cx);
+    }
+
+    fn into_tail(mut self) -> String {
+        self.drain_available_now();
+        self.reader = None;
+        if self.raw.len() > MAX_STDERR_TAIL_BYTES {
+            let start = self.raw.len() - MAX_STDERR_TAIL_BYTES;
+            String::from_utf8_lossy(&self.raw[start..]).into_owned()
+        } else {
+            String::from_utf8_lossy(&self.raw).into_owned()
+        }
     }
 }

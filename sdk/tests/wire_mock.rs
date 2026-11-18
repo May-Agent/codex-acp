@@ -136,34 +136,33 @@ async fn correlation_out_of_order_and_remote_error_decoding() {
         assert!(!line2.contains("jsonrpc"));
         assert!(!line3.contains("jsonrpc"));
 
-        let req1: Value = serde_json::from_str(&line1).unwrap();
-        let req2: Value = serde_json::from_str(&line2).unwrap();
-        let req3: Value = serde_json::from_str(&line3).unwrap();
+        let mut reqs: Vec<Value> = [line1, line2, line3]
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // Reply strictly in reverse wire arrival order to exercise out-of-order correlation.
+        reqs.reverse();
 
-        // Reply out of order: req2 first, req3 with structured error, req1 last.
-        raw_out
-            .send_json(&json!({"id": req2["id"], "result": {"n": 2}}))
-            .await
-            .unwrap();
-        raw_out
-            .send_json(&json!({
-                "id": req3["id"],
-                "error": {
-                    "code": -32600,
-                    "message": "provider mismatch",
-                    "data": {
-                        "type": "modelProviderMismatch",
-                        "modelProvider": "old-p",
-                        "currentModelProvider": "new-p"
+        for req in reqs {
+            let reply = match req["method"].as_str().unwrap() {
+                "op/one" => json!({"id": req["id"], "result": {"n": 1}}),
+                "op/two" => json!({"id": req["id"], "result": {"n": 2}}),
+                "op/err" => json!({
+                    "id": req["id"],
+                    "error": {
+                        "code": -32600,
+                        "message": "provider mismatch",
+                        "data": {
+                            "type": "modelProviderMismatch",
+                            "modelProvider": "old-p",
+                            "currentModelProvider": "new-p"
+                        }
                     }
-                }
-            }))
-            .await
-            .unwrap();
-        raw_out
-            .send_json(&json!({"id": req1["id"], "result": {"n": 1}}))
-            .await
-            .unwrap();
+                }),
+                other => panic!("unexpected method {other}"),
+            };
+            raw_out.send_json(&reply).await.unwrap();
+        }
     });
 
     let c1 = Arc::clone(&client);
@@ -765,6 +764,57 @@ async fn typed_convenience_methods_roundtrip() {
         .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn global_events_broadcasts_and_caps_unsubscribed_backlog() {
+    let ((c_read, c_write), (s_read, s_write)) = duplex_pipes();
+    let (peer, peer_drive) = Connection::new(s_read, s_write);
+    tokio::spawn(peer_drive);
+
+    let (server, drive) = AppServer::attach(c_read, c_write, NoopServerRequestHandler);
+    tokio::spawn(drive);
+
+    // Emit 300 global events while nobody is subscribed; only the latest 256 must be retained.
+    for idx in 0..300_u32 {
+        peer.notify(
+            "account/login/completed",
+            &json!({"loginId": format!("early-{idx}"), "success": true}),
+        )
+        .await
+        .unwrap();
+    }
+    let _ = peer.request("sync/barrier", &json!({})).await;
+
+    let rx_a = server.global_events();
+    let rx_b = server.global_events();
+
+    let mut early_count = 0_usize;
+    while rx_a.try_recv().is_ok() {
+        early_count += 1;
+    }
+    assert_eq!(early_count, 256);
+
+    // Broadcast check: both `rx_a` and `rx_b` must receive new global events (no work-stealing).
+    peer.notify(
+        "account/login/completed",
+        &json!({"loginId": "broadcast-1", "success": true}),
+    )
+    .await
+    .unwrap();
+
+    let ev_a = rx_a.recv().await.unwrap();
+    let ev_b = rx_b.recv().await.unwrap();
+    assert!(matches!(
+        ev_a,
+        ThreadEvent::Notification(Notification::AccountLoginCompleted(ref n))
+            if n.login_id.as_deref() == Some("broadcast-1")
+    ));
+    assert!(matches!(
+        ev_b,
+        ThreadEvent::Notification(Notification::AccountLoginCompleted(ref n))
+            if n.login_id.as_deref() == Some("broadcast-1")
+    ));
+}
+
 #[cfg(all(feature = "process", unix))]
 mod process_tests {
     use std::path::PathBuf;
@@ -925,5 +975,97 @@ mod process_tests {
         .await
         .expect("close() must resolve promptly even when grandchild holds stdout/stderr open");
         assert!(gc_srv.terminal_error().is_none());
+    }
+
+    struct ReentrantCrashHandler {
+        server: Arc<OnceLock<AppServer>>,
+        observed_err_tx: Sender<SdkError>,
+    }
+
+    impl ServerRequestHandler for ReentrantCrashHandler {
+        fn command_execution_approval(
+            &self,
+            _params: CommandExecutionRequestApprovalParams,
+        ) -> impl Future<Output = HandlerResult<CommandExecutionRequestApprovalResponse>> + Send
+        {
+            let server = Arc::clone(&self.server);
+            let observed_err_tx = self.observed_err_tx.clone();
+            async move {
+                let srv = server.get().expect("server populated");
+                match srv.model_list(&ModelListParams::default()).await {
+                    Ok(_) => Ok(CommandExecutionRequestApprovalResponse::accept()),
+                    Err(err) => {
+                        let msg = err.to_string();
+                        let _ = observed_err_tx.try_send(err);
+                        Err(RemoteError::internal_error(msg))
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reentrant_handler_and_surviving_grandchild_stderr_do_not_hang_on_crash() {
+        let sandbox = ScriptSandbox::new();
+        let req_line = serde_json::to_string(&json!({
+            "id": 99,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "t-crash", "turnId": "u-crash", "itemId": "i-crash"}
+        }))
+        .unwrap();
+
+        // Spawn a background grandchild holding ONLY `stderr` open (`>/dev/null`),
+        // emit an inbound server request on `stdout`, write diagnostic text to
+        // `stderr`, and exit 19 so `stdout` hits EOF while the handler makes a
+        // re-entrant `model_list` RPC call and `stderr` still has an open writer!
+        let script = sandbox.write_script(
+            "reentrant-crash.sh",
+            "#!/bin/sh\nsleep 60 >/dev/null &\nprintf '%s\\n' \"$!\" > \"$MOCK_GC_PID\"\nprintf 'reentrant-crash-stderr\\n' >&2\nprintf '%s\\n' \"$MOCK_REQ\"\nexit 19\n",
+        );
+
+        let server_slot = Arc::new(OnceLock::new());
+        let (err_tx, err_rx) = async_channel::bounded(1);
+        let handler = ReentrantCrashHandler {
+            server: Arc::clone(&server_slot),
+            observed_err_tx: err_tx,
+        };
+
+        let cfg = SpawnConfig::new()
+            .codex_path(&script)
+            .env_var("MOCK_GC_PID", sandbox.grandchild_pid_file.to_str().unwrap())
+            .env_var("MOCK_REQ", req_line);
+
+        let (server, drive) = AppServer::spawn(&cfg, handler).unwrap();
+        let _ = server_slot.set(server.clone());
+        let drive_task = tokio::spawn(drive);
+
+        let handler_err = tokio::time::timeout(Duration::from_secs(2), async {
+            drive_task.await.unwrap();
+            err_rx
+                .recv()
+                .await
+                .expect("handler must observe exit error")
+        })
+        .await
+        .expect("driver and re-entrant handler must not deadlock or hang on grandchild stderr");
+
+        match handler_err {
+            SdkError::ProcessExited { status, stderr } => {
+                assert_eq!(status.and_then(|s| s.code()), Some(19));
+                assert!(
+                    stderr.contains("reentrant-crash-stderr"),
+                    "expected captured stderr before grandchild hang, got {stderr:?}"
+                );
+            }
+            other => panic!("expected ProcessExited in re-entrant handler, got {other:?}"),
+        }
+
+        match server.terminal_error() {
+            Some(SdkError::ProcessExited { status, stderr }) => {
+                assert_eq!(status.and_then(|s| s.code()), Some(19));
+                assert!(stderr.contains("reentrant-crash-stderr"));
+            }
+            other => panic!("expected terminal ProcessExited, got {other:?}"),
+        }
     }
 }
