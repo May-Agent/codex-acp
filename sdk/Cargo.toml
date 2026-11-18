@@ -1,0 +1,31 @@
+[package]
+name = "codex-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runtime-agnostic Rust SDK for the OpenAI Codex app-server JSON-RPC protocol"
+publish = false
+
+[features]
+default = ["process"]
+process = ["dep:async-process"]
+
+[dependencies]
+async-channel.workspace = true
+async-lock.workspace = true
+async-process = { workspace = true, optional = true }
+codex-codes.workspace = true
+futures-lite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

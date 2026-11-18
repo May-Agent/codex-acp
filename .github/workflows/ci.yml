@@ -2,20 +2,56 @@ name: CI
 
 on:
   push:
-    branches: [dev]
+    branches: [main]
   pull_request:
   merge_group:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/dev' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  scope:
+    name: Scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE_REV: >-
+            ${{
+              github.event_name == 'pull_request' && format('origin/{0}', github.base_ref)
+              || github.event_name == 'merge_group' && github.event.merge_group.base_sha
+              || (github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000') && github.event.before
+              || ''
+            }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_REV}" ]; then
+            echo "rust=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          merge_base="$(git merge-base "${BASE_REV}" HEAD)"
+          changed_files="$(git diff --name-only "${merge_base}" HEAD)"
+          if [ -z "${changed_files}" ] || grep -Evq '(^|/)[^/]+\.md$|^LICENSE(-[A-Z0-9]+)?$' <<< "${changed_files}"; then
+            echo "rust=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "rust=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   fmt:
     name: Format
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -27,6 +63,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -36,11 +74,15 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ci-ubuntu
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 
-  test:
+  nextest:
     name: Test
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -48,11 +90,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ci-ubuntu
-      - run: cargo test --all-features
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --all-features --no-tests=pass
+      - run: cargo nextest run --workspace --no-default-features --no-tests=pass
+
+  doctest:
+    name: Doc Tests
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: ci-ubuntu
+      - run: cargo test --doc --workspace --all-features
 
   doc:
     name: Docs
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -60,7 +122,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ci-ubuntu
-      - run: cargo doc --all-features --no-deps
+      - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  result:
+    name: CI result
+    if: always()
+    needs:
+      - scope
+      - fmt
+      - clippy
+      - nextest
+      - doctest
+      - doc
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" = failure ] || [ "$result" = cancelled ]; then
+              echo "::error::a needed job ended $result"
+              exit 1
+            fi
+          done

@@ -10,3 +10,7 @@ changelog_update = true
 [[package]]
 name = "codex-acp"
 git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "codex-sdk"
+git_tag_name = "sdk/v{{ version }}"

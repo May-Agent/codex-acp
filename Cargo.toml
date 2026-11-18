@@ -1,11 +1,53 @@
-[package]
-name = "codex-acp"
+[workspace]
+resolver = "2"
+members = [".", "sdk"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Serve OpenAI Codex as an Agent Client Protocol (ACP) agent by bridging the Codex app-server protocol"
+authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/May-Agent/codex-acp"
+
+[workspace.dependencies]
+agent-client-protocol = { version = "5", default-features = false, features = ["stdio", "unstable"] }
+async-channel = { version = "2.5", default-features = false, features = ["std"] }
+async-lock = { version = "3.4", default-features = false, features = ["std"] }
+async-process = { version = "2.5", default-features = false }
+codex-codes = { version = "0.169.3", default-features = false, features = ["types"] }
+codex-sdk = { path = "sdk", version = "0.1.0", default-features = false }
+futures-lite = { version = "2.6", default-features = false, features = ["std"] }
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+thiserror = { version = "2.0", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[workspace.lints]
+rust.missing_docs = "warn"
+rust.missing_debug_implementations = "warn"
+cargo.unused_dependencies = "deny"
+clippy.all = { level = "warn", priority = -1 }
+clippy.style = { level = "warn", priority = -1 }
+clippy.correctness = { level = "warn", priority = -1 }
+clippy.complexity = { level = "warn", priority = -1 }
+clippy.suspicious = { level = "warn", priority = -1 }
+clippy.perf = { level = "warn", priority = -1 }
+clippy.pedantic = { level = "warn", priority = -1 }
+clippy.nursery = { level = "warn", priority = -1 }
+clippy.cargo = { level = "warn", priority = -1 }
+clippy.multiple_crate_versions = { level = "allow", priority = 1 }
+
+[package]
+name = "codex-acp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Serve OpenAI Codex as an Agent Client Protocol (ACP) agent by bridging the Codex app-server protocol"
+readme = "README.md"
 publish = false
 keywords = ["acp", "agent", "protocol", "codex"]
 categories = ["api-bindings"]
@@ -14,40 +56,23 @@ categories = ["api-bindings"]
 default = ["process"]
 # `process` lets the bridge spawn the `codex` binary itself. Consumers that
 # attach an already-connected app-server pair of streams can turn it off.
-process = ["dep:async-process"]
+process = ["codex-sdk/process", "dep:async-process"]
 
 [dependencies]
-agent-client-protocol = { version = "5", features = ["stdio", "unstable"] }
-codex-codes = { version = "0.166.5", default-features = false, features = ["types"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tracing = "0.1"
-futures-lite = "2"
-async-channel = "2"
-async-lock = "3"
-async-process = { version = "2", optional = true }
+agent-client-protocol.workspace = true
+async-channel.workspace = true
+async-lock.workspace = true
+async-process = { workspace = true, optional = true }
+codex-codes.workspace = true
+codex-sdk.workspace = true
+futures-lite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-futures-util = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
 
-[lints.rust]
-missing_docs = "warn"
-missing_debug_implementations = "warn"
-
-[lints.clippy]
-all = "warn"
-style = "warn"
-correctness = "warn"
-complexity = "warn"
-suspicious = "warn"
-perf = "warn"
-pedantic = "warn"
-nursery = "warn"
-cargo = "warn"
-multiple_crate_versions = { level = "allow", priority = 1 }
-struct_excessive_bools = { level = "allow", priority = 1 }
-trivially_copy_pass_by_ref = { level = "allow", priority = 1 }
-cast_precision_loss = { level = "allow", priority = 1 }
+[lints]
+workspace = true

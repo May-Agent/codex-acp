@@ -1,41 +1,37 @@
 # AGENTS.md
 
-`codex-acp` is a library that serves OpenAI Codex as an Agent Client Protocol
-(ACP) agent. It spawns `codex app-server` and translates between ACP
-(JSON-RPC over ndjson, `jsonrpc` field present) and the app-server protocol
-(JSON-RPC over ndjson, `jsonrpc` field absent — wire messages carry only
-`id`/`method`/`params`/`result`/`error`).
+Workspace hosting two runtime-agnostic Rust crates for driving OpenAI Codex:
+
+- `codex-sdk` (`sdk/`) — standalone client for the `codex app-server` NDJSON JSON-RPC protocol (`jsonrpc` field omitted on the wire; LF-only framing preserving unescaped `U+2028`/`U+2029`).
+- `codex-acp` (`src/`) — Agent Client Protocol (ACP) server bridging ACP sessions, prompts, permissions, modes, config options, and slash commands onto `codex app-server`.
 
 ## Build & test
 
 ```bash
-cargo build
-cargo test --all-features          # unit + mock app-server wire tests
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --all
-cargo test --all-features -- --ignored   # live tests against a real `codex` binary
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo nextest run --workspace --all-features --no-tests=pass
+cargo nextest run --workspace --no-default-features --no-tests=pass
+cargo test --doc --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+cargo test --workspace --all-features -- --ignored   # live tests against `codex`
 ```
 
-Live tests need a `codex` binary on PATH (or `CODEX_ACP_CODEX_PATH`) and a
-reachable model provider; they are `#[ignore]`d by default.
+Live tests require a `codex` executable on `PATH` (or `CODEX_PATH`) and a reachable model provider; they are marked `#[ignore]` by default.
 
 ## Layout
 
-- `src/jsonrpc/` — the ndjson JSON-RPC duplex used on both edges (line-split
-  on `\n` only; U+2028/U+2029 appear unescaped inside strings on the wire).
-- `src/app_server/` — spawning `codex app-server`, the `initialize` handshake,
-  typed request helpers, the inbound event stream, and answering server
-  requests (approvals, elicitations).
-- `src/agent/` — the ACP-facing half: session lifecycle, prompt handling,
-  permission bridging, modes, config options, auth methods, slash commands.
-- `src/translate/` — app-server notifications → ACP `session/update`
-  notifications, and history replay for `session/load`.
+- `sdk/src/transport.rs` — cancel-safe LF-only (`\n`) NDJSON reader, writer, and duplex transport.
+- `sdk/src/jsonrpc.rs` — cancel-safe app-server JSON-RPC duplex (`Connection`, `Incoming`).
+- `sdk/src/config.rs` — `SpawnConfig` (`codex_path` / `CODEX_PATH` resolution, `-c` overrides, args, env, cwd, handshake metadata).
+- `sdk/src/handler.rs` — concurrent `ServerRequestHandler` (`AnyServerRequestHandler`, `NoopServerRequestHandler`) for server-initiated approvals and elicitations.
+- `sdk/src/client.rs` — `AppServer` (`attach`, `process`-gated `spawn`, `close`, `handshake`, typed RPC helpers, per-`threadId`/`conversationId` demultiplexing).
+- `src/` — ACP bridge (`agent`, `session`, `translate`, and protocol glue).
 
 ## Conventions
 
-- Runtime-agnostic: futures-lite/async-*
-  primitives, never `tokio::*` in library code (dev-deps may use tokio).
-- Errors are `thiserror` enums; diagnostics go through `tracing`.
-- Wire types come from `codex-codes` (generated from the upstream app-server
-  JSON schema); ACP types come from `agent-client-protocol`. Hand-write only
-  what those crates do not model.
+- Runtime-agnostic library code: `futures-lite`, `async-channel`, `async-lock`, and optional `async-process` (`process` feature); never depend on `tokio` or `anyhow` outside dev-dependencies.
+- Public async methods and traits return `impl Future<Output = ...> + Send` without `Pin<Box<dyn Future>>` in public signatures or `#[allow(clippy::future_not_send)]` suppressions.
+- Errors are typed `thiserror` enums; diagnostics go through `tracing`.
+- App-server wire models come from `codex-codes` (`default-features = false, features = ["types"]`).
