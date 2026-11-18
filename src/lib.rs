@@ -20,3 +20,4 @@ pub mod session;
 pub mod translate;
 
 pub use agent::{CodexAcpConfig, serve, serve_stdio};
+pub use codex_sdk;

@@ -7,8 +7,8 @@ use std::task::{Context, Poll};
 
 use codex_acp::app_server::{AppEvent, AppServer, SpawnConfig};
 use codex_acp::jsonrpc::{Connection, Incoming};
+use futures_lite::Stream as _;
 use futures_lite::io::{AsyncRead, AsyncWrite};
-use futures_util::Stream as _;
 use serde_json::{Value, json};
 
 struct ReadEnd {
