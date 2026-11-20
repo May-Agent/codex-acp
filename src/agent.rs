@@ -1,1505 +1,733 @@
-//! The ACP-facing half: session lifecycle, prompting, permissions, modes,
-//! config options and auth, served on any ACP transport.
+//! The `codex-acp` ACP server: a [`SessionHost`] bridging ACP sessions to
+//! `codex app-server` threads, plus the [`serve`]/[`serve_stdio`] entry
+//! points.
+//!
+//! [`CodexHost`] owns the one shared [`AppServer`]; every session is a
+//! [`CodexSession`] subscribed to a
+//! per-thread event channel and driving a turn through
+//! [`Session::prompt`](aither_acp::server::Session::prompt).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_client_protocol::v1::schema as acp;
-use agent_client_protocol::{self as sdk, Agent, Error as AcpError};
+use aither_acp::domain::ids::AuthMethodId;
+use aither_acp::domain::{
+    AgentAuth, AgentCapabilities, AuthKind, AuthMethod, McpCaps, Open, PromptCaps, SessionCaps,
+    SessionInfo, SessionListParams, SessionPage, SessionSetupParams,
+};
+use aither_acp::rpc::{RpcError, Transport};
+use aither_acp::server::{
+    AuthConfig, AuthRequest, ResumeRequest, Server, ServerError, SessionContext, SessionHost,
+};
+use aither_acp::{Implementation, vendor::codex as vx};
 use async_lock::Mutex;
 use serde_json::{Value, json};
-use tracing::debug;
+use tracing::{debug, error, warn};
 
-use crate::app_server::{AppEvent, AppServer, SpawnConfig};
-use crate::session::{self, Session};
-use crate::translate;
+use crate::app_server::{AppServer, Error};
+use crate::session::CodexSession;
 
-/// Bridge configuration.
-#[derive(Debug, Clone, Default)]
+/// Configuration for the ACP server.
+#[derive(Debug, Clone)]
 pub struct CodexAcpConfig {
-    /// How `codex` is spawned.
-    pub spawn: SpawnConfig,
-    /// Mode applied when the client selects none (`agent`).
-    pub default_mode: Option<String>,
+    /// Spawn configuration for `codex app-server`.
+    pub spawn: crate::app_server::SpawnConfig,
+    /// Initial ACP session mode id (see [`crate::session::all_modes`]).
+    pub default_mode: String,
 }
 
-type Conn = sdk::v1::ConnectionTo<sdk::Client>;
+impl Default for CodexAcpConfig {
+    fn default() -> Self {
+        Self {
+            spawn: crate::app_server::SpawnConfig::default(),
+            default_mode: crate::session::default_mode().id.to_string(),
+        }
+    }
+}
 
-/// Shared bridge state behind the ACP connection.
-pub struct Bridge {
+/// Shared state behind [`CodexHost`].
+struct HostInner {
     server: Arc<AppServer>,
-    sessions: Mutex<HashMap<String, Arc<Session>>>,
-    client_caps: Mutex<acp::ClientCapabilities>,
+    sessions: Arc<Mutex<HashMap<String, CodexSession>>>,
     default_mode: String,
 }
 
-impl Bridge {
-    async fn session(&self, id: &acp::SessionId) -> Result<Arc<Session>, AcpError> {
-        self.sessions
+/// The ACP session host: implements [`SessionHost`] over a `codex
+/// app-server` connection.
+#[derive(Clone)]
+pub struct CodexHost {
+    inner: Arc<HostInner>,
+}
+
+impl CodexHost {
+    /// A host bridging to `server` with the given default mode.
+    #[must_use]
+    pub fn new(server: Arc<AppServer>, default_mode: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(HostInner {
+                server,
+                sessions: Arc::new(Mutex::new(HashMap::new())),
+                default_mode: default_mode.into(),
+            }),
+        }
+    }
+
+    /// The wrapped app-server connection.
+    #[must_use]
+    pub fn server(&self) -> &Arc<AppServer> {
+        &self.inner.server
+    }
+
+    /// Look up a live session by ACP id.
+    pub async fn session(&self, id: &str) -> Option<CodexSession> {
+        self.inner.sessions.lock().await.get(id).cloned()
+    }
+
+    /// Build and register a session around an existing thread.
+    async fn attach(
+        &self,
+        session_id: aither_acp::domain::SessionId,
+        thread_id: String,
+        cwd: PathBuf,
+        events: async_channel::Receiver<crate::app_server::AppEvent>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> CodexSession {
+        let session = CodexSession::new(
+            session_id.clone(),
+            thread_id.clone(),
+            cwd,
+            events,
+            self.inner.server.clone(),
+            self.inner.sessions.clone(),
+            self.inner.default_mode.clone(),
+        );
+        session.set_model_effort(model, effort);
+        self.refresh_models(&session).await;
+        self.inner
+            .sessions
             .lock()
             .await
-            .get(id.0.as_ref())
-            .cloned()
-            .ok_or_else(|| AcpError::invalid_params().data(format!("unknown session {id:?}")))
+            .insert(session_id.to_string(), session.clone());
+        session
     }
 
-    async fn config_options(&self, s: &Session) -> Vec<acp::SessionConfigOption> {
-        let mode = s.mode.lock().await.clone();
-        let model = s.model.lock().await.clone();
-        let effort = s.effort.lock().await.clone();
-        let fast = *s.fast.lock().await;
-        let mut options = vec![session::mode_option(&mode)];
-        if let Ok(models) = self
+    /// Fill the session's cached model list from `model/list`.
+    async fn refresh_models(&self, session: &CodexSession) {
+        let list = self
+            .inner
             .server
-            .call::<_, codex_codes::ModelListResponse>("model/list", &json!({}))
-            .await
-        {
-            let entries: Vec<_> = models
+            .call::<_, codex_codes::ModelListResponse>(
+                "model/list",
+                &json!({"includeHidden": false}),
+            )
+            .await;
+        let models = match list {
+            Ok(list) => list
                 .data
                 .iter()
-                .filter_map(|m| serde_json::to_value(m).ok())
-                .filter_map(|v| {
-                    let id = v.get("id").and_then(Value::as_str)?;
-                    let name = v
-                        .get("displayName")
-                        .or_else(|| v.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or(id);
-                    Some(session::select_option(id, name))
-                })
-                .collect();
-            if !entries.is_empty() {
-                options.push(select_option(
-                    MODEL_CONFIG_ID,
-                    "Model",
-                    "Model used for the next turn",
-                    acp::SessionConfigOptionCategory::Model,
-                    model.as_deref().unwrap_or(""),
-                    entries,
-                ));
-            }
-        }
-        options.push(select_option(
-            EFFORT_CONFIG_ID,
-            "Reasoning effort",
-            "Reasoning effort for the next turn",
-            acp::SessionConfigOptionCategory::ThoughtLevel,
-            effort.as_deref().unwrap_or(""),
-            ["minimal", "low", "medium", "high", "xhigh"]
-                .into_iter()
-                .map(|e| session::select_option(e, e))
+                .map(|m| (m.id.clone(), m.display_name.clone()))
                 .collect(),
-        ));
-        options.push(
-            acp::SessionConfigOption::new(
-                FAST_MODE_CONFIG_ID,
-                "Fast mode",
-                acp::SessionConfigKind::Boolean(acp::SessionConfigBoolean::new(fast)),
-            )
-            .description("Prefer speed over cost for the next turn")
-            .category(acp::SessionConfigOptionCategory::ModelConfig),
-        );
-        options
+            Err(e) => {
+                warn!(%e, "model/list failed; model selector omitted");
+                Vec::new()
+            }
+        };
+        session.set_models(models);
     }
-}
 
-use crate::session::{EFFORT_CONFIG_ID, FAST_MODE_CONFIG_ID, MODEL_CONFIG_ID};
+    /// Subscribe to a thread and return its event receiver.
+    async fn subscribe(
+        &self,
+        thread_id: &str,
+    ) -> async_channel::Receiver<crate::app_server::AppEvent> {
+        self.inner.server.subscribe(thread_id).await
+    }
 
-fn select_option(
-    id: &str,
-    name: &str,
-    description: &str,
-    category: acp::SessionConfigOptionCategory,
-    current: &str,
-    entries: Vec<acp::SessionConfigSelectOption>,
-) -> acp::SessionConfigOption {
-    acp::SessionConfigOption::new(
-        id.to_string(),
-        name.to_string(),
-        acp::SessionConfigKind::Select(acp::SessionConfigSelect::new(
-            current.to_string(),
-            acp::SessionConfigSelectOptions::Ungrouped(entries),
-        )),
-    )
-    .description(description)
-    .category(category)
-}
+    /// Register an already-fetched session; helper for the resume paths.
+    async fn attach_resumed(
+        &self,
+        params: SessionSetupParams,
+        cx: &SessionContext,
+        thread_id: String,
+    ) -> CodexSession {
+        let events = self.subscribe(&thread_id).await;
+        self.attach(
+            cx.session_id().clone(),
+            thread_id,
+            params.cwd,
+            events,
+            None,
+            None,
+        )
+        .await
+    }
 
-fn err(e: impl std::fmt::Display) -> AcpError {
-    AcpError::internal_error().data(e.to_string())
-}
-
-/// Serve the bridge over a caller-provided ACP transport and an attached
-/// app-server.
-///
-/// `drive` is the pump returned by [`AppServer::attach`]/[`AppServer::spawn`];
-/// the connection ends when either side closes.
-///
-/// # Errors
-///
-/// Propagates connection and protocol errors.
-#[allow(clippy::future_not_send, clippy::result_large_err)]
-pub async fn serve<T, D>(
-    transport: T,
-    server: Arc<AppServer>,
-    drive: D,
-    config: CodexAcpConfig,
-) -> Result<(), AcpError>
-where
-    T: sdk::ConnectTo<Agent>,
-    D: Future<Output = ()> + Send,
-{
-    let handshake_cfg = config.spawn.clone();
-    let server2 = server.clone();
-    let bridge = Arc::new(Bridge {
-        server,
-        sessions: Mutex::new(HashMap::new()),
-        client_caps: Mutex::new(acp::ClientCapabilities::default()),
-        default_mode: config
-            .default_mode
-            .filter(|m| session::find_mode(m).is_some())
-            .unwrap_or_else(|| "agent".to_string()),
-    });
-    let serve = async move {
-        server2.handshake(&handshake_cfg).await.map_err(err)?;
-        serve_on(transport, bridge).await
-    };
-    let driven = async move {
-        drive.await;
+    /// Replay a thread's item history into the resume/fork sink.
+    async fn replay(
+        &self,
+        thread_id: &str,
+        replay: &aither_acp::server::ReplaySink,
+    ) -> Result<(), Error> {
+        let thread = self
+            .inner
+            .server
+            .call::<_, codex_codes::ThreadReadResponse>(
+                "thread/read",
+                &json!({"threadId": thread_id}),
+            )
+            .await?;
+        for t in &thread.thread.turns {
+            for item in &t.items {
+                let v = serde_json::to_value(item).unwrap_or_default();
+                for update in replay_update(&v) {
+                    let _ = replay.send(update);
+                }
+            }
+        }
         Ok(())
-    };
-    futures_lite::future::or(serve, driven).await
+    }
 }
 
-/// Spawn `codex app-server` and serve the bridge over process stdio — the
-/// usual editor-adapter entry point.
-///
-/// # Errors
-///
-/// Propagates spawn/handshake and connection errors.
-#[cfg(feature = "process")]
-pub async fn serve_stdio(config: CodexAcpConfig) -> Result<(), AcpError> {
-    let spawn = config.spawn.clone();
-    let (server, drive) = AppServer::spawn(&spawn).await.map_err(err)?;
-    serve(sdk::Stdio::new(), server, drive, config).await
-}
-
-#[allow(clippy::result_large_err, clippy::too_many_lines)]
-async fn serve_on<T: sdk::ConnectTo<Agent>>(
-    transport: T,
-    bridge: Arc<Bridge>,
-) -> Result<(), AcpError> {
-    Agent
-        .v1()
-        .name("codex-acp")
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::InitializeRequest, r, _conn| {
-                    *bridge.client_caps.lock().await = req.client_capabilities.clone();
-                    r.respond(initialize_response(req.protocol_version))
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::AuthenticateRequest, r, _conn| {
-                    authenticate(bridge.clone(), req, r).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::NewSessionRequest, r, _conn| {
-                    new_session(bridge.clone(), req, r).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::LoadSessionRequest, r, conn| {
-                    load_session(bridge.clone(), req, r, conn).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::ResumeSessionRequest, r, _conn| {
-                    resume_session(bridge.clone(), req, r).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::ForkSessionRequest, r, conn| {
-                    fork_session(bridge.clone(), req, r, conn).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::ListSessionsRequest, r, _conn| {
-                    list_sessions(bridge.clone(), req, r).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::CloseSessionRequest, r, _conn| {
-                    close_session(bridge.clone(), req, r).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::DeleteSessionRequest, r, _conn| {
-                    delete_session(bridge.clone(), req, r).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::PromptRequest, r, conn| {
-                    prompt(bridge.clone(), req, r, conn).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::SetSessionModeRequest, r, _conn| {
-                    set_mode(bridge.clone(), req, r).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: acp::SetSessionConfigOptionRequest, r, _conn| {
-                    set_config_option(bridge.clone(), req, r).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let bridge = bridge.clone();
-                async move |req: sdk::UntypedMessage, r, _conn| {
-                    ext_request(bridge.clone(), req, r).await
-                }
-            },
-            sdk::on_receive_request!(),
-        )
-        .on_receive_notification(
-            {
-                let bridge = bridge.clone();
-                async move |n: acp::CancelNotification, _conn| cancel(bridge.clone(), n).await
-            },
-            sdk::on_receive_notification!(),
-        )
-        .connect_to(transport)
-        .await
-}
-
-fn initialize_response(version: sdk::schema::ProtocolVersion) -> acp::InitializeResponse {
-    let caps = acp::AgentCapabilities::new()
-        .load_session(true)
-        .prompt_capabilities(
-            acp::PromptCapabilities::new()
-                .image(true)
-                .embedded_context(true),
-        )
-        .mcp_capabilities(acp::McpCapabilities::new().http(true).sse(true))
-        .session_capabilities(
-            acp::SessionCapabilities::new()
-                .list(acp::SessionListCapabilities::new())
-                .delete(acp::SessionDeleteCapabilities::new())
-                .resume(acp::SessionResumeCapabilities::new())
-                .fork(acp::SessionForkCapabilities::new())
-                .close(acp::SessionCloseCapabilities::new()),
-        );
-    acp::InitializeResponse::new(version)
-        .agent_capabilities(caps)
-        .auth_methods(vec![
-            acp::AuthMethod::Agent(
-                acp::AuthMethodAgent::new("chat-gpt", "ChatGPT")
-                    .description("Sign in with a ChatGPT account"),
-            ),
-            acp::AuthMethod::Agent(
-                acp::AuthMethodAgent::new("api-key", "API key")
-                    .description("Use CODEX_API_KEY or OPENAI_API_KEY"),
-            ),
-        ])
-        .agent_info(acp::Implementation::new("codex-acp", env!("CARGO_PKG_VERSION")).title("Codex"))
-}
-
-#[allow(clippy::result_large_err)]
-async fn authenticate(
-    bridge: Arc<Bridge>,
-    req: acp::AuthenticateRequest,
-    r: sdk::v1::Responder<acp::AuthenticateResponse>,
-) -> Result<(), AcpError> {
-    match req.method_id.0.as_ref() {
-        "api-key" => {
-            let key = std::env::var("CODEX_API_KEY")
-                .or_else(|_| std::env::var("OPENAI_API_KEY"))
-                .map_err(|_| {
-                    AcpError::invalid_params().data("no API key in CODEX_API_KEY/OPENAI_API_KEY")
-                })?;
-            bridge
-                .server
-                .call::<_, Value>(
-                    "account/login/start",
-                    &json!({"type": "apiKey", "apiKey": key}),
-                )
-                .await
-                .map_err(err)?;
-        }
-        method @ ("chat-gpt" | "chat-gpt-device-code") => {
-            let login_type = if method == "chat-gpt-device-code" {
-                "chatgptDeviceCode"
-            } else {
-                "chatgpt"
-            };
-            let resp: Value = bridge
-                .server
-                .call("account/login/start", &json!({"type": login_type}))
-                .await
-                .map_err(err)?;
-            let url = resp
-                .get("authUrl")
+/// One thread item → zero or more replayed session updates.
+fn replay_update(item: &Value) -> Vec<aither_acp::domain::SessionUpdate> {
+    use crate::translate;
+    let p = item.get("payload").unwrap_or(item);
+    let item_type = p.get("type").and_then(Value::as_str).unwrap_or_default();
+    let mut out = Vec::new();
+    match item_type {
+        "userMessage" => {
+            if let Some(text) = p
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("text"))
                 .and_then(Value::as_str)
-                .unwrap_or_default();
-            let login_id = resp.get("loginId").cloned().unwrap_or(Value::Null);
-            tracing::info!(%url, "chatgpt login url");
-            let meta = json!({"authUrl": url});
-            let rx = bridge.server.global_events();
-            loop {
-                let ev = rx
-                    .recv()
-                    .await
-                    .map_err(|_| AcpError::internal_error().data("app-server closed"))?;
-                if let AppEvent::Notification(codex_codes::Notification::AccountLoginCompleted(n)) =
-                    ev
-                {
-                    let raw = serde_json::to_value(&n).unwrap_or_default();
-                    if login_id.is_null() || raw.get("loginId") == Some(&login_id) {
-                        if raw.get("success").and_then(Value::as_bool).unwrap_or(true) {
-                            return r.respond(
-                                acp::AuthenticateResponse::new().meta(meta.as_object().cloned()),
-                            );
-                        }
-                        return Err(AcpError::internal_error().data("login failed"));
-                    }
-                }
+            {
+                out.push(translate::user_chunk(text));
             }
         }
-        other => {
-            return Err(AcpError::invalid_params().data(format!("unknown auth method {other}")));
+        "agentMessage" => {
+            if let Some(text) = p.get("text").and_then(Value::as_str) {
+                out.push(translate::agent_chunk(text));
+            }
         }
+        "reasoning" => {
+            if let Some(text) = p
+                .get("summary")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(Value::as_str)
+            {
+                out.push(translate::thought_chunk(text));
+            }
+        }
+        _ => {}
     }
-    r.respond(acp::AuthenticateResponse::new())
-}
-
-/// Turn client-provided MCP servers into a codex `mcp_servers` config map.
-fn mcp_config(servers: &[acp::McpServer]) -> Value {
-    let mut map = serde_json::Map::new();
-    for s in servers {
-        match s {
-            acp::McpServer::Stdio(stdio) => {
-                let env: serde_json::Map<String, Value> = stdio
-                    .env
-                    .iter()
-                    .map(|e| (e.name.clone(), Value::from(e.value.clone())))
-                    .collect();
-                map.insert(
-                    stdio.name.clone(),
-                    json!({"command": stdio.command, "args": stdio.args, "env": env}),
-                );
-            }
-            acp::McpServer::Http(http) => {
-                let headers: serde_json::Map<String, Value> = http
-                    .headers
-                    .iter()
-                    .map(|h| (h.name.clone(), Value::from(h.value.clone())))
-                    .collect();
-                map.insert(
-                    http.name.clone(),
-                    json!({"url": http.url, "headers": headers}),
-                );
-            }
-            acp::McpServer::Sse(sse) => {
-                let headers: serde_json::Map<String, Value> = sse
-                    .headers
-                    .iter()
-                    .map(|h| (h.name.clone(), Value::from(h.value.clone())))
-                    .collect();
-                map.insert(
-                    sse.name.clone(),
-                    json!({"url": sse.url, "headers": headers}),
-                );
-            }
-            _ => {}
-        }
+    if let Some(update) = translate::item_as_tool_call(item, None) {
+        out.push(aither_acp::domain::SessionUpdate::ToolCallUpdate(update));
     }
-    json!({"mcp_servers": map})
+    out
 }
 
-#[allow(clippy::result_large_err)]
-async fn new_session(
-    bridge: Arc<Bridge>,
-    req: acp::NewSessionRequest,
-    r: sdk::v1::Responder<acp::NewSessionResponse>,
-) -> Result<(), AcpError> {
-    let mode = session::find_mode(&bridge.default_mode).unwrap_or_else(session::default_mode);
-    let resp: codex_codes::ThreadStartResponse = bridge
-        .server
-        .call(
-            "thread/start",
-            &json!({
-                "cwd": req.cwd.to_string_lossy(),
-                "approvalPolicy": mode.approval_policy,
-                "approvalsReviewer": mode.approvals_reviewer,
-                "sandbox": mode.sandbox_mode,
-                "config": mcp_config(&req.mcp_servers),
-            }),
-        )
-        .await
-        .map_err(err)?;
-    let thread_id = resp.thread.id.clone();
-    let events = bridge.server.subscribe(thread_id.clone()).await;
-    let s = Session::new(
-        thread_id,
-        req.cwd.clone(),
-        events,
-        bridge.default_mode.clone(),
-        req.mcp_servers.clone(),
-    );
-    *s.model.lock().await = Some(resp.model.clone());
-    *s.effort.lock().await = resp.reasoning_effort.as_ref().map(|e| e.0.clone());
-    bridge
-        .sessions
-        .lock()
-        .await
-        .insert(s.id.0.to_string(), s.clone());
-    let modes = s.mode_state().await;
-    let config_options = bridge.config_options(&s).await;
-    r.respond(
-        acp::NewSessionResponse::new(s.id.clone())
-            .modes(modes)
-            .config_options(config_options),
-    )
-}
-
-#[allow(clippy::result_large_err)]
-async fn list_sessions(
-    bridge: Arc<Bridge>,
-    req: acp::ListSessionsRequest,
-    r: sdk::v1::Responder<acp::ListSessionsResponse>,
-) -> Result<(), AcpError> {
-    let resp: codex_codes::ThreadListResponse = bridge
-        .server
-        .call(
-            "thread/list",
-            &json!({
-                "cwd": req.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
-                "cursor": req.cursor,
-            }),
-        )
-        .await
-        .map_err(err)?;
-    let sessions = resp
-        .data
+/// MCP session parameters → app-server `mcpConfig` JSON.
+fn mcp_config(params: &SessionSetupParams) -> Value {
+    use aither_acp::domain::McpServer;
+    let servers: Vec<Value> = params
+        .mcp_servers
         .iter()
-        .filter_map(|t| {
-            let v = serde_json::to_value(t).ok()?;
-            let id = v.get("id").and_then(Value::as_str)?.to_string();
-            let cwd = v.get("cwd").and_then(Value::as_str).unwrap_or_default();
-            Some(
-                acp::SessionInfo::new(id, PathBuf::from(cwd))
-                    .title(
-                        v.get("name")
-                            .or_else(|| v.get("title"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    )
-                    .updated_at(
-                        v.get("updatedAt")
-                            .and_then(Value::as_i64)
-                            .map(rfc3339_from_ms),
-                    ),
-            )
+        .filter_map(|s| match s {
+            McpServer::Stdio(s) => Some(json!({
+                "type": "stdio",
+                "name": s.name,
+                "command": s.command,
+                "args": s.args,
+                "env": s.env.iter().map(|e| json!({"name": e.name, "value": e.value}))
+                    .collect::<Vec<_>>(),
+            })),
+            McpServer::Http(s) => Some(json!({
+                "type": "http",
+                "name": s.name,
+                "url": s.url,
+                "headers": s.headers.iter().map(|h| json!({"name": h.name, "value": h.value}))
+                    .collect::<Vec<_>>(),
+            })),
+            // v1 `sse` arrives as Unknown; decode the raw object anyway.
+            McpServer::Unknown(tag, raw) if tag == "sse" => Some(json!({
+                "type": "sse",
+                "name": raw.get("name").cloned().unwrap_or_default(),
+                "url": raw.get("url").cloned().unwrap_or_default(),
+            })),
+            _ => None,
         })
         .collect();
-    r.respond(acp::ListSessionsResponse::new(sessions).next_cursor(resp.next_cursor))
+    json!({"servers": servers})
+}
+
+impl SessionHost for CodexHost {
+    type Session = CodexSession;
+
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            session: Some(SessionCaps {
+                prompt: Some(PromptCaps {
+                    image: Some(aither_acp::domain::patch::EmptyObject),
+                    audio: None,
+                    embedded_context: Some(aither_acp::domain::patch::EmptyObject),
+                    meta: None,
+                    extra: BTreeMap::default(),
+                }),
+                mcp: Some(McpCaps {
+                    stdio: Some(aither_acp::domain::patch::EmptyObject),
+                    http: Some(aither_acp::domain::patch::EmptyObject),
+                    acp: None,
+                    meta: None,
+                    extra: BTreeMap::default(),
+                }),
+                delete: Some(aither_acp::domain::patch::EmptyObject),
+                fork: Some(aither_acp::domain::patch::EmptyObject),
+                options: Some(aither_acp::domain::patch::EmptyObject),
+                additional_directories: None,
+                system_prompt: None,
+                archive: None,
+                status: None,
+                title: None,
+                meta: None,
+                // The v1 codec reads `list`/`resume`/`close`/`loadSession`
+                // out of `extra`.
+                extra: [
+                    ("list".to_string(), json!({})),
+                    ("resume".to_string(), json!({})),
+                    ("close".to_string(), json!({})),
+                    ("loadSession".to_string(), json!(true)),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+            auth: Some(json!({"logout": true})),
+            providers: None,
+            // Extension capabilities: steering is a provider-neutral
+            // convention keyed under `_meta.steering`.
+            meta: Some(json!({
+                aither_acp::ext::steering::CAPABILITY: { "supported": true },
+            })),
+            extra: BTreeMap::default(),
+        }
+    }
+
+    async fn new_session(
+        &self,
+        params: SessionSetupParams,
+        cx: &SessionContext,
+    ) -> Result<Self::Session, ServerError> {
+        let mode = crate::session::default_mode();
+        let cwd = params.cwd.clone();
+        let resp = self
+            .inner
+            .server
+            .call::<_, codex_codes::ThreadStartResponse>(
+                "thread/start",
+                &json!({
+                    "cwd": cwd.to_string_lossy(),
+                    "approvalPolicy": mode.approval_policy,
+                    "approvalsReviewer": mode.approvals_reviewer,
+                    "sandboxPolicy": mode.sandbox_policy,
+                    "sandbox": mode.sandbox_mode,
+                    "config": {"mcp_servers": mcp_config(&params)["servers"]},
+                }),
+            )
+            .await
+            .map_err(|e| ServerError::from(RpcError::internal_error(e.to_string())))?;
+        let thread_id = resp.thread.id.clone();
+        let events = self.subscribe(&thread_id).await;
+        Ok(self
+            .attach(
+                cx.session_id().clone(),
+                thread_id,
+                cwd,
+                events,
+                resp.thread.model.clone(),
+                None,
+            )
+            .await)
+    }
+
+    async fn resume_session(
+        &self,
+        request: ResumeRequest,
+        cx: &SessionContext,
+    ) -> Result<Self::Session, ServerError> {
+        let err = |e: Error| ServerError::from(RpcError::internal_error(e.to_string()));
+        let thread_id = request.params.session_id.to_string();
+        let resp = self
+            .inner
+            .server
+            .call::<_, codex_codes::ThreadResumeResponse>(
+                "thread/resume",
+                &json!({"threadId": thread_id}),
+            )
+            .await
+            .map_err(err)?;
+        let session = self
+            .attach_resumed(request.params.setup, cx, resp.thread.id.clone())
+            .await;
+        session.set_model_effort(resp.thread.model.clone(), None);
+        let _ = self.replay(&resp.thread.id, &request.replay).await;
+        Ok(session)
+    }
+
+    async fn fork_session(
+        &self,
+        request: ResumeRequest,
+        cx: &SessionContext,
+    ) -> Result<Self::Session, ServerError> {
+        let err = |e: Error| ServerError::from(RpcError::internal_error(e.to_string()));
+        let thread_id = request.params.session_id.to_string();
+        let resp = self
+            .inner
+            .server
+            .call::<_, codex_codes::ThreadForkResponse>(
+                "thread/fork",
+                &json!({"threadId": thread_id}),
+            )
+            .await
+            .map_err(err)?;
+        let session = self
+            .attach_resumed(request.params.setup, cx, resp.thread.id.clone())
+            .await;
+        let _ = self.replay(&resp.thread.id, &request.replay).await;
+        Ok(session)
+    }
+
+    async fn list_sessions(&self, params: SessionListParams) -> Result<SessionPage, RpcError> {
+        let cwd = params.cwd.clone();
+        let resp = self
+            .inner
+            .server
+            .call::<_, codex_codes::ThreadListResponse>(
+                "thread/list",
+                &json!({
+                    "cwd": cwd.as_ref().map(|p| p.to_string_lossy()),
+                    "cursor": params.cursor,
+                    "archived": false,
+                }),
+            )
+            .await
+            .map_err(|e| RpcError::internal_error(e.to_string()))?;
+        Ok(SessionPage {
+            sessions: resp
+                .data
+                .iter()
+                .map(|t| SessionInfo {
+                    session_id: t.id.clone().into(),
+                    cwd: PathBuf::from(t.cwd.as_str().unwrap_or_default()),
+                    title: t
+                        .name
+                        .clone()
+                        .or_else(|| (!t.preview.is_empty()).then(|| t.preview.clone())),
+                    updated_at: Some(rfc3339_from_ms(t.updated_at)),
+                    meta: None,
+                    extra: BTreeMap::default(),
+                })
+                .collect(),
+            next_cursor: resp.next_cursor.clone(),
+            meta: None,
+            extra: BTreeMap::default(),
+        })
+    }
+
+    async fn delete_session(
+        &self,
+        session_id: &aither_acp::domain::SessionId,
+    ) -> Result<(), RpcError> {
+        // Live sessions know their thread id; stored sessions are keyed by
+        // the thread id directly (see `list_sessions`).
+        let thread_id = self.session(session_id.as_str()).await.map_or_else(
+            || session_id.to_string(),
+            |session| session.thread_id().to_string(),
+        );
+        self.inner
+            .server
+            .call::<_, Value>("thread/delete", &json!({"threadId": thread_id}))
+            .await
+            .map_err(|e| RpcError::internal_error(e.to_string()))?;
+        let _ = self
+            .inner
+            .server
+            .call::<_, Value>("thread/unsubscribe", &json!({"threadId": thread_id}))
+            .await;
+        self.inner.server.unsubscribe(&thread_id).await;
+        self.inner.sessions.lock().await.remove(session_id.as_str());
+        Ok(())
+    }
 }
 
 /// ISO-8601 UTC timestamp from epoch milliseconds without a date dependency.
 fn rfc3339_from_ms(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
-    let days = secs.div_euclid(86400);
-    let day_secs = secs.rem_euclid(86400);
-    let (y, mo, d) = civil_from_days(days);
-    format!(
-        "{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        day_secs / 3600,
-        day_secs % 3600 / 60,
-        day_secs % 60
-    )
-}
-
-/// Howard Hinnant's civil-from-days algorithm.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
+    let nanos = u32::try_from(ms.rem_euclid(1000)).unwrap_or_default() * 1_000_000;
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (hour, min, sec) = (tod / 3600, tod % 3600 / 60, tod % 60);
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let doe = shifted.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1);
-    let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1);
-    (y + i64::from(m <= 2), m, d)
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let full_year = if month <= 2 { year + 1 } else { year };
+    format!("{full_year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{nanos:09}Z")
 }
 
-/// `thread/resume` + session registration shared by load/resume.
-#[allow(clippy::result_large_err)]
-async fn resume_thread(
-    bridge: &Arc<Bridge>,
-    thread_id: &str,
-    cwd: &std::path::Path,
-    mcp_servers: &[acp::McpServer],
-) -> Result<Arc<Session>, AcpError> {
-    // Subscribe before resuming: events can start streaming immediately.
-    let events = bridge.server.subscribe(thread_id.to_string()).await;
-    let resp: Value = bridge
-        .server
-        .call(
-            "thread/resume",
-            &json!({
-                "threadId": thread_id,
-                "cwd": cwd.to_string_lossy(),
-                "config": mcp_config(mcp_servers),
-            }),
-        )
-        .await
-        .map_err(err)?;
-    let s = Session::new(
-        thread_id.to_string(),
-        cwd.to_path_buf(),
-        events,
-        bridge.default_mode.clone(),
-        mcp_servers.to_vec(),
-    );
-    *s.model.lock().await = resp
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    *s.effort.lock().await = resp
-        .get("reasoningEffort")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    bridge
-        .sessions
-        .lock()
-        .await
-        .insert(s.id.0.to_string(), s.clone());
-    Ok(s)
-}
-
-/// Replay stored thread items as session updates.
-#[allow(clippy::result_large_err)]
-async fn replay_history(
-    bridge: &Arc<Bridge>,
-    s: &Session,
-    conn: &Conn,
-    session_id: &acp::SessionId,
-) -> Result<(), AcpError> {
-    let thread: Value = bridge
-        .server
-        .call(
-            "thread/read",
-            &json!({"threadId": s.thread_id, "includeTurns": true}),
-        )
-        .await
-        .map_err(err)?;
-    let turns = thread
-        .get("thread")
-        .and_then(|t| t.get("turns"))
-        .or_else(|| thread.get("turns"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for turn in &turns {
-        for item in turn
-            .get("items")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let payload = item.get("payload").unwrap_or(item);
-            match payload.get("type").and_then(Value::as_str) {
-                Some("userMessage") => {
-                    let text = payload
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .map(|c| {
-                            c.iter()
-                                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                                .filter_map(|b| b.get("text").and_then(Value::as_str))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .unwrap_or_default();
-                    send_update(
-                        conn,
-                        session_id,
-                        acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
-                            acp::ContentBlock::Text(acp::TextContent::new(text)),
-                        )),
-                    );
-                }
-                Some("agentMessage") => {
-                    let text = payload
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    send_update(conn, session_id, translate::agent_delta(text));
-                }
-                Some("reasoning") => {
-                    let text = payload
-                        .get("summary")
-                        .and_then(Value::as_array)
-                        .and_then(|s| s.first())
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    send_update(conn, session_id, translate::thought_delta(text));
-                }
-                Some(_) => {
-                    let status = payload.get("status").and_then(Value::as_str);
-                    let update = if matches!(status, Some("completed" | "failed" | "declined")) {
-                        translate::item_completed_update(payload)
-                    } else {
-                        translate::item_as_tool_call(payload, acp::ToolCallStatus::Pending)
-                    };
-                    if let Some(u) = update {
-                        send_update(conn, session_id, u);
-                    }
-                }
-                None => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-fn send_update(conn: &Conn, session_id: &acp::SessionId, update: acp::SessionUpdate) {
-    let _ = conn.send_notification(acp::SessionNotification::new(session_id.clone(), update));
-}
-
-#[allow(clippy::result_large_err)]
-async fn load_session(
-    bridge: Arc<Bridge>,
-    req: acp::LoadSessionRequest,
-    r: sdk::v1::Responder<acp::LoadSessionResponse>,
-    conn: Conn,
-) -> Result<(), AcpError> {
-    let s = resume_thread(
-        &bridge,
-        req.session_id.0.as_ref(),
-        &req.cwd,
-        &req.mcp_servers,
-    )
-    .await?;
-    replay_history(&bridge, &s, &conn, &req.session_id).await?;
-    let modes = s.mode_state().await;
-    let config_options = bridge.config_options(&s).await;
-    r.respond(
-        acp::LoadSessionResponse::new()
-            .modes(modes)
-            .config_options(config_options),
-    )
-}
-
-#[allow(clippy::result_large_err)]
-async fn resume_session(
-    bridge: Arc<Bridge>,
-    req: acp::ResumeSessionRequest,
-    r: sdk::v1::Responder<acp::ResumeSessionResponse>,
-) -> Result<(), AcpError> {
-    let s = resume_thread(
-        &bridge,
-        req.session_id.0.as_ref(),
-        &req.cwd,
-        &req.mcp_servers,
-    )
-    .await?;
-    let modes = s.mode_state().await;
-    let config_options = bridge.config_options(&s).await;
-    r.respond(
-        acp::ResumeSessionResponse::new()
-            .modes(modes)
-            .config_options(config_options),
-    )
-}
-
-#[allow(clippy::result_large_err)]
-async fn fork_session(
-    bridge: Arc<Bridge>,
-    req: acp::ForkSessionRequest,
-    r: sdk::v1::Responder<acp::ForkSessionResponse>,
-    conn: Conn,
-) -> Result<(), AcpError> {
-    let resp: Value = bridge
-        .server
-        .call(
-            "thread/fork",
-            &json!({
-                "threadId": req.session_id.0.as_ref(),
-                "config": mcp_config(&req.mcp_servers),
-            }),
-        )
-        .await
-        .map_err(err)?;
-    let new_id = resp
-        .get("thread")
-        .and_then(|t| t.get("id"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| AcpError::internal_error().data("fork returned no thread id"))?
-        .to_string();
-    let events = bridge.server.subscribe(new_id.clone()).await;
-    let s = Session::new(
-        new_id.clone(),
-        req.cwd.clone(),
-        events,
-        bridge.default_mode.clone(),
-        req.mcp_servers.clone(),
-    );
-    let acp_id = acp::SessionId::new(new_id.clone());
-    bridge.sessions.lock().await.insert(new_id, s.clone());
-    replay_history(&bridge, &s, &conn, &acp_id).await?;
-    let modes = s.mode_state().await;
-    let config_options = bridge.config_options(&s).await;
-    r.respond(
-        acp::ForkSessionResponse::new(acp_id)
-            .modes(modes)
-            .config_options(config_options),
-    )
-}
-
-#[allow(clippy::result_large_err)]
-async fn close_session(
-    bridge: Arc<Bridge>,
-    req: acp::CloseSessionRequest,
-    r: sdk::v1::Responder<acp::CloseSessionResponse>,
-) -> Result<(), AcpError> {
-    let id = req.session_id.0.to_string();
-    let session = bridge.sessions.lock().await.get(&id).cloned();
-    if let Some(s) = session {
-        let turn = s.active_turn.lock().await.clone();
-        if let Some(turn_id) = turn {
-            let _ = bridge
-                .server
-                .call::<_, Value>(
-                    "turn/interrupt",
-                    &json!({"threadId": s.thread_id, "turnId": turn_id}),
-                )
-                .await;
-        }
-    }
-    let _ = bridge
-        .server
-        .call::<_, Value>("thread/unsubscribe", &json!({"threadId": id}))
-        .await;
-    bridge.server.unsubscribe(&id).await;
-    bridge.sessions.lock().await.remove(&id);
-    r.respond(acp::CloseSessionResponse::new())
-}
-
-#[allow(clippy::result_large_err)]
-async fn delete_session(
-    bridge: Arc<Bridge>,
-    req: acp::DeleteSessionRequest,
-    r: sdk::v1::Responder<acp::DeleteSessionResponse>,
-) -> Result<(), AcpError> {
-    let id = req.session_id.0.to_string();
-    bridge
-        .server
-        .call::<_, Value>("thread/delete", &json!({"threadId": id}))
-        .await
-        .map_err(err)?;
-    bridge.server.unsubscribe(&id).await;
-    bridge.sessions.lock().await.remove(&id);
-    r.respond(acp::DeleteSessionResponse::new())
-}
-
-/// Map ACP prompt content to app-server `UserInput`s.
-fn prompt_input(prompt: &[acp::ContentBlock], cwd: &std::path::Path) -> Vec<Value> {
-    let mut input = Vec::new();
-    for block in prompt {
-        match block {
-            acp::ContentBlock::Text(t) => input.push(json!({"type": "text", "text": t.text})),
-            acp::ContentBlock::Image(i) => input.push(json!({
-                "type": "image",
-                "url": format!("data:{};base64,{}", i.mime_type, i.data),
-            })),
-            acp::ContentBlock::ResourceLink(l) => {
-                if let Some(path) = l.uri.strip_prefix("file://") {
-                    input.push(json!({
-                        "type": "mention",
-                        "name": l.name,
-                        "path": path,
-                    }));
-                } else {
-                    let _ = cwd;
-                }
-            }
-            acp::ContentBlock::Resource(res) => {
-                if let acp::EmbeddedResourceResource::TextResourceContents(t) = &res.resource {
-                    input.push(json!({"type": "text", "text": t.text}));
-                }
-            }
-            acp::ContentBlock::Audio(a) => input.push(json!({
-                "type": "audio",
-                "url": format!("data:{};base64,{}", a.mime_type, a.data),
-            })),
-            _ => {}
-        }
-    }
-    input
-}
-
-/// Whether the prompt is exactly one slash command.
-fn slash_command(prompt: &[acp::ContentBlock]) -> Option<String> {
-    if let [acp::ContentBlock::Text(t)] = prompt {
-        t.text.trim().strip_prefix('/').map(str::to_string)
-    } else {
-        None
-    }
-}
-
-#[allow(clippy::result_large_err, clippy::too_many_lines)]
-async fn prompt(
-    bridge: Arc<Bridge>,
-    req: acp::PromptRequest,
-    r: sdk::v1::Responder<acp::PromptResponse>,
-    conn: Conn,
-) -> Result<(), AcpError> {
-    let session = bridge.session(&req.session_id).await?;
-    if let Some(cmd) = slash_command(&req.prompt) {
-        return run_command(&bridge, &session, &cmd, r, &conn).await;
-    }
-    let mode = session::find_mode(&session.mode.lock().await).unwrap_or_else(session::default_mode);
-    let model = session.model.lock().await.clone();
-    let effort = session.effort.lock().await.clone();
-    let fast = *session.fast.lock().await;
-    let input = prompt_input(&req.prompt, &session.cwd);
-    let resp: codex_codes::TurnStartResponse = bridge
-        .server
-        .call(
-            "turn/start",
-            &json!({
-                "threadId": session.thread_id,
-                "input": input,
-                "cwd": session.cwd.to_string_lossy(),
-                "model": model,
-                "effort": effort,
-                "serviceTierForTurn": fast.then_some("fast"),
-                "approvalPolicy": mode.approval_policy,
-                "approvalsReviewer": mode.approvals_reviewer,
-                "sandboxPolicy": mode.sandbox_policy,
-            }),
-        )
-        .await
-        .map_err(err)?;
-    let turn_id = resp.turn.id.clone();
-    *session.active_turn.lock().await = Some(turn_id);
-
-    let stop = run_turn(&bridge, &session, &conn).await?;
-    *session.active_turn.lock().await = None;
-    r.respond(acp::PromptResponse::new(stop))
-}
-
-#[allow(clippy::large_enum_variant)]
-enum EventOrCancel {
-    Event(AppEvent),
-    Cancelled,
-}
-
-/// Consume session events until the turn ends; translate + forward them.
-#[allow(clippy::result_large_err)]
-async fn run_turn(
-    bridge: &Arc<Bridge>,
-    session: &Arc<Session>,
-    conn: &Conn,
-) -> Result<acp::StopReason, AcpError> {
-    let turn_id = session.active_turn.lock().await.clone().unwrap_or_default();
-    // Stale cancels from between turns must not kill a fresh turn.
-    while session.cancel_rx.try_recv().is_ok() {}
-    let notices_ok = bridge
-        .client_caps
-        .lock()
-        .await
-        .session
-        .as_ref()
-        .is_some_and(|s| s.notices.is_some());
-    loop {
-        let ev = futures_lite::future::or(
-            async { session.events.recv().await.map(EventOrCancel::Event) },
-            async {
-                session
-                    .cancel_rx
-                    .recv()
-                    .await
-                    .map(|()| EventOrCancel::Cancelled)
-            },
-        )
-        .await
-        .map_err(|_| AcpError::internal_error().data("app-server event channel closed"))?;
-        let ev = match ev {
-            EventOrCancel::Cancelled => {
-                let _ = bridge
-                    .server
-                    .call::<_, Value>(
-                        "turn/interrupt",
-                        &json!({"threadId": session.thread_id, "turnId": turn_id}),
-                    )
-                    .await;
-                return Ok(acp::StopReason::Cancelled);
-            }
-            EventOrCancel::Event(e) => e,
-        };
-        match ev {
-            AppEvent::Notification(n) => {
-                if let Some(stop) = forward_notification(&n, session, conn, notices_ok) {
-                    return Ok(stop);
-                }
-            }
-            AppEvent::Request { id, request } => {
-                handle_server_request(bridge, session, id, request, conn).await;
-            }
-            AppEvent::Unknown { id: Some(id), .. } => {
-                let _ = bridge
-                    .server
-                    .respond_error(&id, -32601, "request unsupported by this bridge")
-                    .await;
-            }
-            AppEvent::Unknown { .. } => {}
-        }
-    }
-}
-
-/// Returns `Some(stop_reason)` when the turn finished.
-#[allow(clippy::result_large_err)]
-fn forward_notification(
-    n: &codex_codes::Notification,
-    session: &Arc<Session>,
-    conn: &Conn,
-    notices_ok: bool,
-) -> Option<acp::StopReason> {
-    use codex_codes::Notification as N;
-    let sid = &session.id;
-    // Skip turn-scoped leftovers from another turn.
-    if let Some(tid) = n.turn_id() {
-        let active = session
-            .active_turn
-            .try_lock()
-            .map(|g| g.clone().unwrap_or_default())
-            .unwrap_or_default();
-        if !tid.is_empty() && tid != active {
-            return None;
-        }
-    }
-    match n {
-        N::AgentMessageDelta(d) => send_update(conn, sid, translate::agent_delta(&d.delta)),
-        N::ReasoningDelta(d) => {
-            send_update(conn, sid, translate::thought_delta(&d.delta));
-        }
-        N::ReasoningTextDelta(d) => {
-            send_update(conn, sid, translate::thought_delta(&d.delta));
-        }
-        N::CmdOutputDelta(d) => {
-            send_update(conn, sid, translate::output_delta(&d.item_id, &d.delta));
-        }
-        N::FileChangeOutputDelta(d) => {
-            let v = serde_json::to_value(d).unwrap_or_default();
-            let delta = v.get("delta").and_then(Value::as_str).unwrap_or_default();
-            send_update(conn, sid, translate::output_delta(&d.item_id, delta));
-        }
-        N::FileChangePatchUpdated(d) => {
-            let changes = serde_json::to_value(&d.changes).unwrap_or_default();
-            send_update(
-                conn,
-                sid,
-                translate::patch_update(&d.item_id, changes.as_array().map_or(&[], Vec::as_slice)),
-            );
-        }
-        N::ItemStarted(n) => {
-            let v = serde_json::to_value(&n.item).unwrap_or_default();
-            if let Some(u) = translate::item_as_tool_call(&v, acp::ToolCallStatus::InProgress) {
-                send_update(conn, sid, u);
-            }
-        }
-        N::ItemCompleted(n) => {
-            let v = serde_json::to_value(&n.item).unwrap_or_default();
-            if let Some(u) = translate::item_completed_update(&v) {
-                send_update(conn, sid, u);
-            }
-        }
-        N::PlanDelta(d) => send_update(conn, sid, translate::agent_delta(&d.delta)),
-        N::TurnPlanUpdated(d) => {
-            let v = serde_json::to_value(d).unwrap_or_default();
-            send_update(conn, sid, plan_update(&v));
-        }
-        N::TurnCompleted(n) => {
-            let v = serde_json::to_value(&n.turn).unwrap_or_default();
-            let completed_id = v.get("id").and_then(Value::as_str).unwrap_or_default();
-            let active = session
-                .active_turn
-                .try_lock()
-                .map(|g| g.clone().unwrap_or_default())
-                .unwrap_or_default();
-            if !completed_id.is_empty() && completed_id != active {
-                return None;
-            }
-            return Some(translate::stop_reason(&v));
-        }
-        N::ThreadTokenUsageUpdated(n) => {
-            let v = serde_json::to_value(&n.token_usage).unwrap_or_default();
-            send_update(conn, sid, translate::usage_update(&v));
-        }
-        N::Error(e) if notices_ok => {
-            let v = serde_json::to_value(e).unwrap_or_default();
-            send_update(conn, sid, notice(acp::NoticeSeverity::Error, &v));
-        }
-        N::Warning(e) if notices_ok => {
-            let v = serde_json::to_value(e).unwrap_or_default();
-            send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v));
-        }
-        N::ConfigWarning(e) if notices_ok => {
-            let v = serde_json::to_value(e).unwrap_or_default();
-            send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v));
-        }
-        N::GuardianWarning(e) if notices_ok => {
-            let v = serde_json::to_value(e).unwrap_or_default();
-            send_update(conn, sid, notice(acp::NoticeSeverity::Warning, &v));
-        }
-        N::ContextCompacted(n) if notices_ok => {
-            let v = serde_json::to_value(n).unwrap_or_default();
-            send_update(
-                conn,
-                sid,
-                acp::SessionUpdate::Notice(
-                    acp::Notice::new(acp::NoticeSeverity::Info, "Context compacted")
-                        .description(v.get("turnId").and_then(Value::as_str).map(str::to_string)),
-                ),
-            );
-        }
-        _ => {}
-    }
-    None
-}
-
-fn plan_update(plan: &Value) -> acp::SessionUpdate {
-    let entries = plan
-        .get("plan")
-        .and_then(Value::as_array)
-        .or_else(|| plan.get("entries").and_then(Value::as_array))
-        .map(|es| {
-            es.iter()
-                .map(|e| {
-                    acp::PlanEntry::new(
-                        e.get("step")
-                            .or_else(|| e.get("content"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        acp::PlanEntryPriority::Medium,
-                        match e.get("status").and_then(Value::as_str) {
-                            Some("completed") => acp::PlanEntryStatus::Completed,
-                            Some("inProgress" | "in_progress") => acp::PlanEntryStatus::InProgress,
-                            _ => acp::PlanEntryStatus::Pending,
-                        },
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    acp::SessionUpdate::Plan(acp::Plan::new(entries))
-}
-
-fn notice(severity: acp::NoticeSeverity, v: &Value) -> acp::SessionUpdate {
-    acp::SessionUpdate::Notice(
-        acp::Notice::new(
-            severity,
-            v.get("message")
-                .or_else(|| v.get("error").and_then(|e| e.get("message")))
-                .and_then(Value::as_str)
-                .unwrap_or("notification")
-                .to_string(),
-        )
-        .description(
-            v.get("additionalDetails")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        ),
-    )
-}
-
-/// Forward an app-server approval/elicitation request to the ACP client.
-async fn handle_server_request(
-    bridge: &Arc<Bridge>,
-    session: &Arc<Session>,
-    id: Value,
-    request: codex_codes::ServerRequest,
-    conn: &Conn,
-) {
-    use codex_codes::ServerRequest as R;
-    match request {
-        R::CmdExecApproval(p) => {
-            let raw = serde_json::to_value(&p).unwrap_or_default();
-            let decision = ask(conn, &session.id, "Run command?", &raw).await;
-            let _ = bridge
-                .server
-                .respond(
-                    &id,
-                    &json!({"decision": approval_decision(decision.as_deref())}),
-                )
-                .await;
-        }
-        R::ExecCommandApproval(p) => {
-            let raw = serde_json::to_value(&p).unwrap_or_default();
-            let decision = ask(conn, &session.id, "Run command?", &raw).await;
-            let _ = bridge
-                .server
-                .respond(
-                    &id,
-                    &json!({"decision": approval_decision(decision.as_deref())}),
-                )
-                .await;
-        }
-        R::FileChangeApproval(p) => {
-            let raw = serde_json::to_value(&p).unwrap_or_default();
-            let decision = ask(conn, &session.id, "Apply file changes?", &raw).await;
-            let _ = bridge
-                .server
-                .respond(
-                    &id,
-                    &json!({"decision": approval_decision(decision.as_deref())}),
-                )
-                .await;
-        }
-        R::ApplyPatchApproval(p) => {
-            let raw = serde_json::to_value(&p).unwrap_or_default();
-            let decision = ask(conn, &session.id, "Apply file changes?", &raw).await;
-            let _ = bridge
-                .server
-                .respond(
-                    &id,
-                    &json!({"decision": approval_decision(decision.as_deref())}),
-                )
-                .await;
-        }
-        R::McpServerElicitationRequest(_) => {
-            let _ = bridge
-                .server
-                .respond(&id, &json!({"action": "decline"}))
-                .await;
-        }
-        other => {
-            debug!(
-                ?other,
-                "answering unsupported server request with a refusal"
-            );
-            let _ = bridge
-                .server
-                .respond_error(&id, -32601, "request unsupported by this bridge")
-                .await;
-        }
-    }
-}
-
-/// Map a client permission outcome onto the app-server's `decision` values.
-fn approval_decision(option: Option<&str>) -> &'static str {
-    match option {
-        Some("allow_always") => "acceptForSession",
-        Some("allow") => "accept",
-        Some("reject" | "reject_always") => "decline",
-        _ => "cancel",
-    }
-}
-
-/// Ask the client for permission; returns the selected option id.
-async fn ask(conn: &Conn, session_id: &acp::SessionId, title: &str, raw: &Value) -> Option<String> {
-    let options = [
-        (
-            "allow_always",
-            "Always allow",
-            acp::PermissionOptionKind::AllowAlways,
-        ),
-        ("allow", "Allow once", acp::PermissionOptionKind::AllowOnce),
-        ("reject", "Reject", acp::PermissionOptionKind::RejectOnce),
-        (
-            "reject_always",
-            "Always reject",
-            acp::PermissionOptionKind::RejectAlways,
-        ),
+/// The Codex auth methods advertised on `initialize`.
+fn auth_methods() -> Vec<AuthMethod> {
+    [
+        (vx::auth::CHAT_GPT, "Sign in with ChatGPT"),
+        (vx::auth::API_KEY, "Use an API key"),
     ]
     .into_iter()
-    .map(|(id, name, kind)| acp::PermissionOption::new(id, name, kind))
-    .collect();
-    let tool_call = acp::ToolCallUpdate::new(
-        raw.get("itemId")
-            .and_then(Value::as_str)
-            .unwrap_or("approval")
-            .to_string(),
-        acp::ToolCallUpdateFields::new()
-            .title(title)
-            .raw_input(raw.clone()),
-    );
-    let response = conn
-        .send_request(acp::RequestPermissionRequest::new(
-            session_id.clone(),
-            tool_call,
-            options,
-        ))
-        .block_task()
-        .await
-        .ok()?;
-    match response.outcome {
-        acp::RequestPermissionOutcome::Selected(sel) => Some(sel.option_id.0.to_string()),
-        _ => None,
+    .map(|(id, name)| AuthMethod {
+        method_id: AuthMethodId::from_string(id),
+        name: name.to_string(),
+        description: None,
+        kind: Open::Known(AuthKind::Agent(AgentAuth::default())),
+        meta: None,
+        extra: BTreeMap::default(),
+    })
+    .collect()
+}
+
+/// `auth/login` and `auth/logout` forwarded to the app-server account API.
+async fn handle_auth(host: &CodexHost, request: AuthRequest) -> Result<(), RpcError> {
+    let server = host.server();
+    match request {
+        AuthRequest::Login(method_id) => {
+            let _resp: Value = if method_id.as_str() == vx::auth::API_KEY {
+                let key = std::env::var("OPENAI_API_KEY")
+                    .map_err(|_| RpcError::invalid_params("OPENAI_API_KEY is not set"))?;
+                server
+                    .call(
+                        "account/login/start",
+                        &json!({"type": "apiKey", "apiKey": key}),
+                    )
+                    .await
+                    .map_err(|e| RpcError::internal_error(e.to_string()))?
+            } else {
+                let login_type = if method_id.as_str() == vx::auth::CHAT_GPT_DEVICE_CODE {
+                    "chatgptDeviceCode"
+                } else {
+                    "chatgpt"
+                };
+                server
+                    .call("account/login/start", &json!({"type": login_type}))
+                    .await
+                    .map_err(|e| RpcError::internal_error(e.to_string()))?
+            };
+            // Wait for the login completion notification on the global lane.
+            let rx = server.global_events();
+            loop {
+                match rx.recv().await {
+                    Ok(crate::app_server::AppEvent::Notification(
+                        codex_codes::Notification::AccountLoginCompleted(_),
+                    )) => return Ok(()),
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(RpcError::internal_error(format!(
+                            "login watcher closed: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+        AuthRequest::Logout(_) => {
+            server
+                .call::<_, Value>("account/logout", &json!({}))
+                .await
+                .map_err(|e| RpcError::internal_error(e.to_string()))?;
+            Ok(())
+        }
     }
 }
 
-#[allow(clippy::result_large_err)]
-async fn cancel(bridge: Arc<Bridge>, n: acp::CancelNotification) -> Result<(), AcpError> {
-    if let Ok(s) = bridge.session(&n.session_id).await {
-        let _ = s.cancel_tx.try_send(());
+/// `_`-prefixed extension methods: steering plus goal-control aliases.
+async fn handle_ext(
+    host: &CodexHost,
+    method: &aither_acp::domain::ExtMethod,
+    params: Option<Value>,
+) -> Result<Value, RpcError> {
+    match method.as_str() {
+        "_session/steering" | "_codex/session/steering" => {
+            let params = params.ok_or_else(|| RpcError::invalid_params("missing params"))?;
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::invalid_params("missing sessionId"))?;
+            let session = host
+                .session(session_id)
+                .await
+                .ok_or_else(|| RpcError::invalid_params(format!("unknown session {session_id}")))?;
+            // Both `message` and `prompt` payloads are accepted; `prompt`
+            // may be a string or a content-block array.
+            let input = match params.get("message").or_else(|| params.get("prompt")) {
+                Some(Value::String(s)) => vec![json!({"type": "text", "text": s})],
+                Some(Value::Array(blocks)) => {
+                    let blocks: Vec<aither_acp::domain::ContentBlock> =
+                        serde_json::from_value(Value::Array(blocks.clone()))
+                            .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+                    blocks
+                        .iter()
+                        .filter_map(|b| b.as_text())
+                        .map(|t| json!({"type": "text", "text": t}))
+                        .collect()
+                }
+                _ => return Err(RpcError::invalid_params("missing prompt/message")),
+            };
+            let turn_id = session
+                .active_turn_id()
+                .await
+                .ok_or_else(|| RpcError::invalid_params("no active turn to steer"))?;
+            let resp: Value = session_server(host)
+                .call(
+                    "turn/steer",
+                    &json!({
+                        "threadId": session.thread_id(),
+                        "expectedTurnId": turn_id,
+                        "input": input,
+                    }),
+                )
+                .await
+                .map_err(|e| RpcError::internal_error(e.to_string()))?;
+            Ok(json!({
+                "outcome": aither_acp::ext::steering::SteeringOutcome::Injected.as_str(),
+                "turnId": resp.get("turnId").cloned().unwrap_or_default(),
+            }))
+        }
+        _ => Err(RpcError::method_not_found(method.as_str())),
     }
+}
+
+fn session_server(host: &CodexHost) -> &Arc<AppServer> {
+    host.server()
+}
+
+/// Non-extension methods the standard dispatch does not cover: the Codex
+/// legacy model/account surface.
+async fn handle_unknown(
+    host: &CodexHost,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, RpcError> {
+    match method {
+        vx::SET_MODEL_METHOD => {
+            let params = params.ok_or_else(|| RpcError::invalid_params("missing params"))?;
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::invalid_params("missing sessionId"))?;
+            let session = host
+                .session(session_id)
+                .await
+                .ok_or_else(|| RpcError::invalid_params(format!("unknown session {session_id}")))?;
+            let model = params
+                .get("model")
+                .or_else(|| params.get("modelId"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            session.set_model(model);
+            Ok(json!({}))
+        }
+        vx::AUTHENTICATION_STATUS_METHOD => {
+            let v: Value = host
+                .server()
+                .call("account/read", &json!({}))
+                .await
+                .map_err(|e| RpcError::internal_error(e.to_string()))?;
+            Ok(json!({"type": "account", "account": v}))
+        }
+        vx::AUTHENTICATION_LOGOUT_METHOD => {
+            host.server()
+                .call::<_, Value>("account/logout", &json!({}))
+                .await
+                .map_err(|e| RpcError::internal_error(e.to_string()))?;
+            Ok(json!({}))
+        }
+        _ => Err(RpcError::method_not_found(method)),
+    }
+}
+
+/// Serve ACP over `transport`, translating every session onto `server`.
+///
+/// `drive` must be the [`AppServer`] demultiplexer future returned by
+/// [`AppServer::attach`]/[`AppServer::spawn`]; it is polled alongside the
+/// ACP connection so
+/// app-server traffic keeps flowing for the lifetime of the connection.
+///
+/// # Errors
+///
+/// Returns an error when the app-server handshake fails or the demux
+/// ends before the handshake completes.
+pub async fn serve<T, D>(
+    transport: T,
+    server: Arc<AppServer>,
+    drive: D,
+    config: CodexAcpConfig,
+) -> Result<(), Error>
+where
+    T: Transport + 'static,
+    D: Future<Output = ()> + Send,
+{
+    futures_lite::pin!(drive);
+    // The handshake needs the demux running to receive responses; race it
+    // against the drive future so both keep polling.
+    let handshake = futures_lite::future::or(server.handshake(&config.spawn), async {
+        drive.as_mut().await;
+        Err(Error::Connection(crate::jsonrpc::Error::Closed))
+    })
+    .await;
+    if let Err(e) = handshake {
+        error!(%e, "codex app-server handshake failed");
+        return Err(e);
+    }
+    let host = CodexHost::new(server, config.default_mode);
+    let info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    let ext_host = host.clone();
+    let unknown_host = host.clone();
+    let auth_host = host.clone();
+    let acp = Server::builder(host, info)
+        .auth(AuthConfig::new(auth_methods(), move |req| {
+            let host = auth_host.clone();
+            async move { handle_auth(&host, req).await }
+        }))
+        .ext(move |method, params| {
+            let host = ext_host.clone();
+            async move { handle_ext(&host, &method, params).await }
+        })
+        .unknown_handler(Arc::new(move |method: &str, params: Option<Value>| {
+            let host = unknown_host.clone();
+            let method = method.to_string();
+            Box::pin(async move { handle_unknown(&host, &method, params).await })
+                as std::pin::Pin<Box<dyn Future<Output = Result<Value, RpcError>> + Send>>
+        }))
+        .build();
+    let (_peer, serve) = acp.serve(transport);
+    futures_lite::future::or(serve, drive).await;
+    debug!("ACP connection closed");
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
-async fn set_mode(
-    bridge: Arc<Bridge>,
-    req: acp::SetSessionModeRequest,
-    r: sdk::v1::Responder<acp::SetSessionModeResponse>,
-) -> Result<(), AcpError> {
-    let s = bridge.session(&req.session_id).await?;
-    let id = req.mode_id.0.to_string();
-    if session::find_mode(&id).is_none() {
-        return Err(AcpError::invalid_params().data(format!("unknown mode {id}")));
-    }
-    *s.mode.lock().await = id;
-    r.respond(acp::SetSessionModeResponse::new())
-}
-
-#[allow(clippy::result_large_err)]
-async fn set_config_option(
-    bridge: Arc<Bridge>,
-    req: acp::SetSessionConfigOptionRequest,
-    r: sdk::v1::Responder<acp::SetSessionConfigOptionResponse>,
-) -> Result<(), AcpError> {
-    let s = bridge.session(&req.session_id).await?;
-    match req.config_id.0.as_ref() {
-        session::MODE_CONFIG_ID => {
-            let id = req
-                .value
-                .as_value_id()
-                .map(|v| v.0.to_string())
-                .unwrap_or_default();
-            if session::find_mode(&id).is_none() {
-                return Err(AcpError::invalid_params().data(format!("unknown mode {id}")));
-            }
-            *s.mode.lock().await = id;
-        }
-        MODEL_CONFIG_ID => {
-            *s.model.lock().await = req.value.as_value_id().map(|v| v.0.to_string());
-        }
-        EFFORT_CONFIG_ID => {
-            *s.effort.lock().await = req.value.as_value_id().map(|v| v.0.to_string());
-        }
-        FAST_MODE_CONFIG_ID => {
-            *s.fast.lock().await = req.value.as_bool().unwrap_or(false);
-        }
-        other => {
-            return Err(AcpError::invalid_params().data(format!("unknown config option {other}")));
-        }
-    }
-    let options = bridge.config_options(&s).await;
-    r.respond(acp::SetSessionConfigOptionResponse::new(options))
-}
-
-/// `_`-prefixed extension methods, including the codex dialect's legacy names.
-#[allow(clippy::result_large_err)]
-async fn ext_request(
-    bridge: Arc<Bridge>,
-    req: sdk::UntypedMessage,
-    r: sdk::v1::Responder<serde_json::Value>,
-) -> Result<(), AcpError> {
-    let method = req.method.as_ref();
-    let params = req.params.clone();
-    let session_id = params
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let result = match method {
-        "session/set_model" => {
-            if let Some(sid) = session_id {
-                let s = bridge.session(&acp::SessionId::new(sid)).await?;
-                *s.model.lock().await = params
-                    .get("modelId")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-            }
-            json!({})
-        }
-        "_session/steering" | "_codex/session/steering" => {
-            if let Some(sid) = session_id {
-                let s = bridge.session(&acp::SessionId::new(sid)).await?;
-                let text = params
-                    .get("message")
-                    .or_else(|| params.get("prompt"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let turn = s.active_turn.lock().await.clone();
-                if let Some(turn) = turn {
-                    let _: Value = bridge
-                        .server
-                        .call(
-                            "turn/steer",
-                            &json!({
-                                "threadId": s.thread_id,
-                                "expectedTurnId": turn,
-                                "input": [{"type": "text", "text": text}],
-                            }),
-                        )
-                        .await
-                        .map_err(err)?;
-                }
-            }
-            json!({})
-        }
-        "authentication/logout" | "logout" => {
-            let _: Value = bridge
-                .server
-                .call("account/logout", &json!({}))
-                .await
-                .map_err(err)?;
-            json!({})
-        }
-        "authentication/status" => {
-            let v: Value = bridge
-                .server
-                .call("account/read", &json!({}))
-                .await
-                .map_err(err)?;
-            json!({"type": "account", "account": v})
-        }
-        _ => {
-            return Err(AcpError::method_not_found().data(format!("unknown method {method}")));
-        }
-    };
-    r.respond(result)
-}
-
-/// A `/`-command prompt: run the codex-side action and report as updates.
-#[allow(clippy::result_large_err)]
-async fn run_command(
-    bridge: &Arc<Bridge>,
-    session: &Arc<Session>,
-    cmd: &str,
-    r: sdk::v1::Responder<acp::PromptResponse>,
-    conn: &Conn,
-) -> Result<(), AcpError> {
-    let (name, args) = cmd.split_once(' ').unwrap_or((cmd, ""));
-    match name {
-        "compact" => {
-            let _: Value = bridge
-                .server
-                .call(
-                    "thread/compact/start",
-                    &json!({"threadId": session.thread_id}),
-                )
-                .await
-                .map_err(err)?;
-            r.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
-        }
-        "logout" => {
-            let _: Value = bridge
-                .server
-                .call("account/logout", &json!({}))
-                .await
-                .map_err(err)?;
-            r.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
-        }
-        "status" => {
-            let v: Value = bridge
-                .server
-                .call("account/read", &json!({}))
-                .await
-                .unwrap_or_default();
-            send_update(
-                conn,
-                &session.id,
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    acp::ContentBlock::Text(acp::TextContent::new(format!("Account: {v}"))),
-                )),
-            );
-            r.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
-        }
-        "review" | "review-branch" | "review-commit" => {
-            let target = match name {
-                "review-branch" => json!({"type": "baseBranch", "branch": args.trim()}),
-                "review-commit" => json!({"type": "commit", "sha": args.trim()}),
-                _ => json!({"type": "uncommittedChanges"}),
-            };
-            let resp: codex_codes::TurnStartResponse = bridge
-                .server
-                .call(
-                    "review/start",
-                    &json!({"threadId": session.thread_id, "target": target}),
-                )
-                .await
-                .map_err(err)?;
-            *session.active_turn.lock().await = Some(resp.turn.id);
-            let stop = run_turn(bridge, session, conn).await?;
-            *session.active_turn.lock().await = None;
-            r.respond(acp::PromptResponse::new(stop))
-        }
-        _ => {
-            send_update(
-                conn,
-                &session.id,
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    acp::ContentBlock::Text(acp::TextContent::new(format!(
-                        "Unknown command: /{name}"
-                    ))),
-                )),
-            );
-            r.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
-        }
-    }
+/// Serve ACP over stdio, spawning `codex app-server` per `config`.
+///
+/// # Errors
+///
+/// Returns an error when the app-server fails to spawn or its handshake
+/// fails.
+#[cfg(feature = "process")]
+pub async fn serve_stdio(config: CodexAcpConfig) -> Result<(), Error> {
+    let (server, drive) = AppServer::spawn(&config.spawn).await?;
+    serve(aither_acp::rpc::Stdio::new(), server, drive, config).await
 }

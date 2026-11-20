@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/May-Agent/codex-acp"
 
 [workspace.dependencies]
-agent-client-protocol = { version = "5", default-features = false, features = ["stdio", "unstable"] }
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "feat/acp-v1v2-redesign", default-features = false, features = ["stdio", "process"] }
 async-channel = { version = "2.5", default-features = false, features = ["std"] }
 async-lock = { version = "3.4", default-features = false, features = ["std"] }
 async-process = { version = "2.5", default-features = false }
@@ -59,7 +59,7 @@ default = ["process"]
 process = ["codex-sdk/process", "dep:async-process"]
 
 [dependencies]
-agent-client-protocol.workspace = true
+aither-acp.workspace = true
 async-channel.workspace = true
 async-lock.workspace = true
 async-process = { workspace = true, optional = true }
