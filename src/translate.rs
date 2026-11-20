@@ -1,31 +1,36 @@
-//! App-server thread items and notifications → ACP `SessionUpdate`s.
+//! App-server thread items and notifications → ACP domain updates.
 //!
 //! Items are translated from their JSON form so the mapping stays robust
 //! across app-server versions: unknown fields pass through untouched and
 //! unknown item kinds degrade to a generic tool call instead of an error.
 
-use agent_client_protocol::v1::schema as acp;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use aither_acp::domain::patch::EmptyObject;
+use aither_acp::domain::{
+    Content, Diff, DiffChange, DiffOperation, DiffPatch, DiffPatchFormat, DiffPathChange, Location,
+    Open, Patch, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionUpdate, StopReason,
+    ToolCallCaps, ToolCallContent, ToolCallContentChunk, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolKind, UsageUpdate,
+};
 use serde_json::Value;
 
-fn text_block(text: impl Into<String>) -> acp::ContentBlock {
-    acp::ContentBlock::Text(acp::TextContent::new(text.into()))
-}
-
-fn status_of(s: &str) -> acp::ToolCallStatus {
+fn status_of(s: &str) -> ToolCallStatus {
     match s {
-        "completed" => acp::ToolCallStatus::Completed,
-        "failed" | "declined" => acp::ToolCallStatus::Failed,
-        "inProgress" => acp::ToolCallStatus::InProgress,
-        _ => acp::ToolCallStatus::Pending,
+        "completed" => ToolCallStatus::Completed,
+        "failed" | "declined" => ToolCallStatus::Failed,
+        "inProgress" => ToolCallStatus::InProgress,
+        _ => ToolCallStatus::Pending,
     }
 }
 
-fn kind_of(item_type: &str) -> acp::ToolKind {
+fn kind_of(item_type: &str) -> ToolKind {
     match item_type {
-        "commandExecution" => acp::ToolKind::Execute,
-        "fileChange" => acp::ToolKind::Edit,
-        "webSearch" | "imageView" => acp::ToolKind::Fetch,
-        _ => acp::ToolKind::Other,
+        "commandExecution" => ToolKind::Execute,
+        "fileChange" => ToolKind::Edit,
+        "webSearch" | "imageView" => ToolKind::Fetch,
+        _ => ToolKind::Other,
     }
 }
 
@@ -80,6 +85,51 @@ fn title_of(item_type: &str, payload: &Value) -> String {
     }
 }
 
+/// The programmatic name reported for an item kind.
+fn name_of(item_type: &str, payload: &Value) -> String {
+    match item_type {
+        "mcpToolCall" | "dynamicToolCall" | "functionCallOutput" => payload
+            .get("tool")
+            .or_else(|| payload.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(item_type)
+            .to_string(),
+        _ => item_type.to_string(),
+    }
+}
+
+/// Locations a tool item touches, when derivable.
+fn locations_of(item_type: &str, payload: &Value) -> Vec<Location> {
+    let mut out = Vec::new();
+    match item_type {
+        "commandExecution" => {
+            if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
+                out.push(Location {
+                    path: PathBuf::from(cwd),
+                    line: None,
+                    meta: None,
+                });
+            }
+        }
+        "fileChange" => {
+            if let Some(changes) = payload.get("changes").and_then(Value::as_array) {
+                for path in changes
+                    .iter()
+                    .filter_map(|c| c.get("path").and_then(Value::as_str))
+                {
+                    out.push(Location {
+                        path: PathBuf::from(path),
+                        line: None,
+                        meta: None,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 const TOOL_ITEMS: &[&str] = &[
     "commandExecution",
     "fileChange",
@@ -93,42 +143,99 @@ const TOOL_ITEMS: &[&str] = &[
     "imageView",
 ];
 
-/// A started or historical thread item → a `ToolCall` update, or `None`
-/// when the item is not tool-shaped.
+/// A started or historical thread item → a `ToolCallUpdate` upsert, or
+/// `None` when the item is not tool-shaped.
 #[must_use]
-pub fn item_as_tool_call(item: &Value, status: acp::ToolCallStatus) -> Option<acp::SessionUpdate> {
+pub fn item_as_tool_call(item: &Value, status: Option<ToolCallStatus>) -> Option<ToolCallUpdate> {
     let p = payload(item);
     let item_type = p.get("type")?.as_str()?;
     if !TOOL_ITEMS.contains(&item_type) {
         return None;
     }
-    let status = if status == acp::ToolCallStatus::Pending {
+    let status = status.unwrap_or_else(|| {
         p.get("status")
             .and_then(Value::as_str)
-            .map_or(status, status_of)
-    } else {
-        status
-    };
-    let mut call = acp::ToolCall::new(item_id(item)?, title_of(item_type, p))
-        .kind(kind_of(item_type))
-        .status(status);
-    if let Some(content) = diff_content(p) {
-        call = call.content(content);
+            .map_or(ToolCallStatus::Pending, status_of)
+    });
+    let mut update = ToolCallUpdate::new(ToolCallId::from_string(item_id(item)?));
+    update.name = Patch::Set(name_of(item_type, p));
+    update.title = Patch::Set(title_of(item_type, p));
+    update.kind = Patch::Set(Open::Known(kind_of(item_type)));
+    update.status = Patch::Set(Open::Known(status));
+    update.raw_input = Patch::Set(p.clone());
+    let locations = locations_of(item_type, p);
+    if !locations.is_empty() {
+        update.locations = Patch::Set(locations);
     }
-    Some(acp::SessionUpdate::ToolCall(call))
+    if let Some(content) = diff_content(p) {
+        update.content = Patch::Set(content);
+    }
+    // Commands may be interrupted mid-flight; mark them cancellable.
+    if item_type == "commandExecution" && status == ToolCallStatus::InProgress {
+        update.capabilities = Patch::Set(ToolCallCaps {
+            cancel: Some(EmptyObject),
+            meta: None,
+            extra: BTreeMap::new(),
+        });
+    }
+    Some(update)
 }
 
-fn diff_content(p: &Value) -> Option<Vec<acp::ToolCallContent>> {
+fn operation_of(c: &Value) -> DiffOperation {
+    let path = || DiffPathChange {
+        path: PathBuf::from(c.get("path").and_then(Value::as_str).unwrap_or_default()),
+    };
+    match c
+        .get("kind")
+        .or_else(|| c.get("type"))
+        .or_else(|| c.get("operation"))
+        .and_then(Value::as_str)
+    {
+        Some("add" | "create" | "created") => DiffOperation::Add(path()),
+        Some("delete" | "deleted" | "remove") => DiffOperation::Delete(path()),
+        Some("move" | "rename" | "renamed") => DiffOperation::Move(DiffPathPairChange {
+            old_path: PathBuf::from(
+                c.get("oldPath")
+                    .or_else(|| c.get("old_path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            path: PathBuf::from(c.get("path").and_then(Value::as_str).unwrap_or_default()),
+        }),
+        _ => DiffOperation::Modify(path()),
+    }
+}
+
+use aither_acp::domain::DiffPathPairChange;
+
+/// The codex `changes` array → one `diff` content item per file change.
+fn diff_content(p: &Value) -> Option<Vec<ToolCallContent>> {
     let changes = p.get("changes")?.as_array()?;
     Some(
         changes
             .iter()
-            .filter_map(|c| {
-                let path = c.get("path").and_then(Value::as_str)?;
-                Some(acp::ToolCallContent::Diff(acp::Diff::new(
-                    std::path::PathBuf::from(path),
-                    c.get("diff").and_then(Value::as_str).unwrap_or_default(),
-                )))
+            .filter(|c| c.get("path").and_then(Value::as_str).is_some())
+            .map(|c| {
+                ToolCallContent::Diff(Diff {
+                    changes: vec![DiffChange {
+                        operation: Open::Known(operation_of(c)),
+                        file_type: None,
+                        mime_type: None,
+                        meta: None,
+                        extra: BTreeMap::new(),
+                    }],
+                    patch: Some(DiffPatch {
+                        format: Open::Known(DiffPatchFormat::GitPatch),
+                        text: c
+                            .get("diff")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        meta: None,
+                    }),
+                    meta: None,
+                    extra: BTreeMap::new(),
+                })
             })
             .collect(),
     )
@@ -136,19 +243,19 @@ fn diff_content(p: &Value) -> Option<Vec<acp::ToolCallContent>> {
 
 /// A completed thread item → its terminal `ToolCallUpdate`.
 #[must_use]
-pub fn item_completed_update(item: &Value) -> Option<acp::SessionUpdate> {
+pub fn item_completed_update(item: &Value) -> Option<ToolCallUpdate> {
     let p = payload(item);
     if !TOOL_ITEMS.contains(&p.get("type").and_then(Value::as_str)?) {
         return None;
     }
-    let id = item_id(item)?;
+    let mut update = ToolCallUpdate::new(ToolCallId::from_string(item_id(item)?));
     let status = p
         .get("status")
         .and_then(Value::as_str)
-        .map_or(acp::ToolCallStatus::Completed, status_of);
-    let mut fields = acp::ToolCallUpdateFields::new().status(status);
+        .map_or(ToolCallStatus::Completed, status_of);
+    update.status = Patch::Set(Open::Known(status));
     if let Some(content) = diff_content(p) {
-        fields = fields.content(content);
+        update.content = Patch::Set(content);
     }
     if let Some(out) = p
         .get("aggregatedOutput")
@@ -156,63 +263,77 @@ pub fn item_completed_update(item: &Value) -> Option<acp::SessionUpdate> {
         .or_else(|| p.get("result"))
         .cloned()
     {
-        fields = fields.raw_output(out);
+        update.raw_output = Patch::Set(out);
     }
-    Some(acp::SessionUpdate::ToolCallUpdate(
-        acp::ToolCallUpdate::new(id, fields),
-    ))
+    Some(update)
 }
 
-/// `item/agentMessage/delta` → `AgentMessageChunk`.
+/// A command/file output delta → `ToolCallContentChunk` appending text.
 #[must_use]
-pub fn agent_delta(delta: &str) -> acp::SessionUpdate {
-    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(text_block(delta)))
-}
-
-/// `item/reasoning/*Delta` → `AgentThoughtChunk`.
-#[must_use]
-pub fn thought_delta(delta: &str) -> acp::SessionUpdate {
-    acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(text_block(delta)))
-}
-
-/// A command/file output delta → `ToolCallUpdate` appending text content.
-#[must_use]
-pub fn output_delta(item_id: &str, delta: &str) -> acp::SessionUpdate {
-    let fields = acp::ToolCallUpdateFields::new().content(vec![acp::ToolCallContent::Content(
-        acp::Content::new(text_block(delta)),
-    )]);
-    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(item_id.to_string(), fields))
+pub fn output_chunk(item_id: &str, delta: &str) -> ToolCallContentChunk {
+    ToolCallContentChunk {
+        tool_call_id: ToolCallId::from_string(item_id),
+        content: ToolCallContent::Content(Content {
+            content: aither_acp::domain::ContentBlock::text(delta),
+            meta: None,
+            extra: BTreeMap::new(),
+        }),
+        meta: None,
+        extra: BTreeMap::new(),
+    }
 }
 
 /// `item/fileChange/patchUpdated` → `ToolCallUpdate` carrying the diff.
 #[must_use]
-pub fn patch_update(item_id: &str, changes: &[Value]) -> acp::SessionUpdate {
-    let content: Vec<_> = changes
-        .iter()
-        .filter_map(|c| {
-            let path = c.get("path").and_then(Value::as_str)?;
-            Some(acp::ToolCallContent::Diff(acp::Diff::new(
-                path,
-                c.get("diff").and_then(Value::as_str).unwrap_or_default(),
-            )))
+pub fn patch_update(item_id: &str, changes: &[Value]) -> ToolCallUpdate {
+    let mut update = ToolCallUpdate::new(ToolCallId::from_string(item_id));
+    if let Some(content) = diff_content(&serde_json::json!({"changes": changes})) {
+        update.content = Patch::Set(content);
+    }
+    update
+}
+
+/// A `turn/plan/updated` payload → plan entries (content/status/priority).
+#[must_use]
+pub fn plan_entries(plan: &Value) -> Vec<PlanEntry> {
+    plan.get("plan")
+        .and_then(Value::as_array)
+        .or_else(|| plan.get("entries").and_then(Value::as_array))
+        .map(|es| {
+            es.iter()
+                .map(|e| PlanEntry {
+                    content: e
+                        .get("step")
+                        .or_else(|| e.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    priority: Some(Open::Known(PlanEntryPriority::Medium)),
+                    status: Some(Open::Known(match e.get("status").and_then(Value::as_str) {
+                        Some("completed") => PlanEntryStatus::Completed,
+                        Some("inProgress" | "in_progress") => PlanEntryStatus::InProgress,
+                        _ => PlanEntryStatus::Pending,
+                    })),
+                    meta: None,
+                    extra: BTreeMap::new(),
+                })
+                .collect()
         })
-        .collect();
-    let fields = acp::ToolCallUpdateFields::new().content(content);
-    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(item_id.to_string(), fields))
+        .unwrap_or_default()
 }
 
 /// `turn/completed` → ACP stop reason.
 #[must_use]
-pub fn stop_reason(turn: &Value) -> acp::StopReason {
+pub fn stop_reason(turn: &Value) -> StopReason {
     match turn.get("status").and_then(Value::as_str) {
-        Some("interrupted") => acp::StopReason::Cancelled,
-        _ => acp::StopReason::EndTurn,
+        Some("interrupted") => StopReason::Cancelled,
+        _ => StopReason::EndTurn,
     }
 }
 
 /// `thread/tokenUsage/updated` → `UsageUpdate`.
 #[must_use]
-pub fn usage_update(token_usage: &Value) -> acp::SessionUpdate {
+pub fn usage_update(token_usage: &Value) -> UsageUpdate {
     let used = token_usage
         .get("total")
         .and_then(|t| t.get("totalTokens"))
@@ -224,13 +345,46 @@ pub fn usage_update(token_usage: &Value) -> acp::SessionUpdate {
         .or_else(|| token_usage.get("contextWindow"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(used, size))
+    UsageUpdate {
+        used,
+        size: Some(size),
+        cost: None,
+        meta: None,
+        extra: BTreeMap::new(),
+    }
+}
+
+/// A replayed user message → `UserMessageChunk`.
+#[must_use]
+pub fn user_chunk(text: impl Into<String>) -> SessionUpdate {
+    SessionUpdate::UserMessageChunk(aither_acp::domain::ContentChunk::new(
+        aither_acp::domain::MessageId::new(),
+        aither_acp::domain::ContentBlock::text(text.into()),
+    ))
+}
+
+/// A replayed agent message → `AgentMessageChunk`.
+#[must_use]
+pub fn agent_chunk(text: impl Into<String>) -> SessionUpdate {
+    SessionUpdate::AgentMessageChunk(aither_acp::domain::ContentChunk::new(
+        aither_acp::domain::MessageId::new(),
+        aither_acp::domain::ContentBlock::text(text.into()),
+    ))
+}
+
+/// A replayed reasoning summary → `AgentThoughtChunk`.
+#[must_use]
+pub fn thought_chunk(text: impl Into<String>) -> SessionUpdate {
+    SessionUpdate::AgentThoughtChunk(aither_acp::domain::ContentChunk::new(
+        aither_acp::domain::MessageId::new(),
+        aither_acp::domain::ContentBlock::text(text.into()),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::v1::schema::{SessionUpdate, ToolCallStatus, ToolKind};
+    use aither_acp::domain::{SessionUpdate as U, ToolCallStatus};
 
     #[test]
     fn usage_reads_total_total_tokens() {
@@ -239,11 +393,9 @@ mod tests {
             "total": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12},
             "modelContextWindow": 272_000,
         });
-        let SessionUpdate::UsageUpdate(u) = usage_update(&usage) else {
-            panic!("expected usage update")
-        };
+        let u = usage_update(&usage);
         assert_eq!(u.used, 12);
-        assert_eq!(u.size, 272_000);
+        assert_eq!(u.size, Some(272_000));
     }
 
     #[test]
@@ -255,7 +407,7 @@ mod tests {
             serde_json::json!({"type": "plan", "id": "p1", "text": "plan"}),
         ] {
             assert!(item_completed_update(&item).is_none(), "{item}");
-            assert!(item_as_tool_call(&item, ToolCallStatus::Completed).is_none());
+            assert!(item_as_tool_call(&item, Some(ToolCallStatus::Completed)).is_none());
         }
     }
 
@@ -266,12 +418,13 @@ mod tests {
             "status": "completed", "aggregatedOutput": "out",
             "commandActions": [], "cwd": "/tmp",
         });
-        let Some(SessionUpdate::ToolCallUpdate(u)) = item_completed_update(&item) else {
-            panic!("expected tool call update")
-        };
-        assert_eq!(u.tool_call_id.0.as_ref(), "e1");
-        assert_eq!(u.fields.status, Some(ToolCallStatus::Completed));
-        assert_eq!(u.fields.raw_output, Some(serde_json::json!("out")));
+        let u = item_completed_update(&item).expect("tool call update");
+        assert_eq!(u.tool_call_id.as_str(), "e1");
+        assert!(matches!(
+            u.status,
+            Patch::Set(Open::Known(ToolCallStatus::Completed))
+        ));
+        assert_eq!(u.raw_output, Patch::Set(serde_json::json!("out")));
     }
 
     #[test]
@@ -279,28 +432,40 @@ mod tests {
         let started = serde_json::json!({
             "type": "fileChange", "id": "f1", "changes": [], "status": "inProgress",
         });
-        let Some(SessionUpdate::ToolCall(c)) =
-            item_as_tool_call(&started, ToolCallStatus::InProgress)
-        else {
-            panic!("expected tool call")
-        };
-        assert_eq!(c.kind, ToolKind::Edit);
-        assert_eq!(c.status, ToolCallStatus::InProgress);
+        let c = item_as_tool_call(&started, Some(ToolCallStatus::InProgress)).expect("tool call");
+        assert!(matches!(c.kind, Patch::Set(Open::Known(ToolKind::Edit))));
+        assert!(matches!(
+            c.status,
+            Patch::Set(Open::Known(ToolCallStatus::InProgress))
+        ));
     }
 
     #[test]
     fn stop_reason_mapping() {
         assert_eq!(
             stop_reason(&serde_json::json!({"status": "interrupted"})),
-            acp::StopReason::Cancelled
+            StopReason::Cancelled
         );
         assert_eq!(
             stop_reason(&serde_json::json!({"status": "failed"})),
-            acp::StopReason::EndTurn
+            StopReason::EndTurn
         );
         assert_eq!(
             stop_reason(&serde_json::json!({"status": "completed"})),
-            acp::StopReason::EndTurn
+            StopReason::EndTurn
         );
+    }
+
+    #[test]
+    fn patch_update_carries_diffs() {
+        let u = patch_update(
+            "f1",
+            &[serde_json::json!({"path": "/a.rs", "diff": "@@ -1 +1 @@", "kind": "update"})],
+        );
+        let Patch::Set(ref content) = u.content else {
+            panic!("expected content patch")
+        };
+        assert_eq!(content.len(), 1);
+        let _ = U::ToolCallUpdate(u);
     }
 }
