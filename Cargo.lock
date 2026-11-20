@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "aither-acp"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2Facp-v1v2-redesign#152bc71a47f30c8ada2a216948db5a4e303a1440"
+source = "git+https://github.com/May-Agent/aither?branch=main#7a2cfb525b2936440b3c9c998265a3678187d5a6"
 dependencies = [
  "async-channel",
  "async-process",
