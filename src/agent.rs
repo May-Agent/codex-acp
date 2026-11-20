@@ -506,10 +506,27 @@ fn auth_methods() -> Vec<AuthMethod> {
 async fn handle_auth(host: &CodexHost, request: AuthRequest) -> Result<(), RpcError> {
     let server = host.server();
     match request {
-        AuthRequest::Login(method_id) => {
-            let _resp: Value = if method_id.as_str() == vx::auth::API_KEY {
-                let key = std::env::var("OPENAI_API_KEY")
-                    .map_err(|_| RpcError::invalid_params("OPENAI_API_KEY is not set"))?;
+        AuthRequest::Login(req) => {
+            let _resp: Value = if req.method_id.as_str() == vx::auth::API_KEY {
+                let key = req
+                    .meta
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|o| {
+                        o.get("apiKey")
+                            .or_else(|| o.get("api_key"))
+                            .or_else(|| o.get("token"))
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+                    .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                    .ok_or_else(|| {
+                        RpcError::invalid_params(
+                            "no apiKey in auth/login _meta and OPENAI_API_KEY is not set",
+                        )
+                    })?;
                 server
                     .call(
                         "account/login/start",
@@ -518,7 +535,7 @@ async fn handle_auth(host: &CodexHost, request: AuthRequest) -> Result<(), RpcEr
                     .await
                     .map_err(|e| RpcError::internal_error(e.to_string()))?
             } else {
-                let login_type = if method_id.as_str() == vx::auth::CHAT_GPT_DEVICE_CODE {
+                let login_type = if req.method_id.as_str() == vx::auth::CHAT_GPT_DEVICE_CODE {
                     "chatgptDeviceCode"
                 } else {
                     "chatgpt"
