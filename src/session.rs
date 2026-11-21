@@ -1,567 +1,330 @@
-//! Per-session bridge state, the session's mode/config-option surface,
-//! and the turn driver.
+//! Per-session ACP state and streaming `ThreadEvent` -> `SessionUpdate` turn loop.
 
-use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aither_acp::domain::ids::ConfigId;
 use aither_acp::domain::{
-    AvailableCommand, Command, CommandInput, ConfigCategory, ConfigKind, ConfigOption, ConfigValue,
-    ConfigValueId, ContentBlock, NoticeSeverity, Open, Patch, PermissionOption,
-    PermissionOptionKind, PermissionOutcome, PermissionRequest, PermissionSubject, PlanId,
-    ResourceContents, SelectConfig, SelectOption, SelectOptions, SessionId, SessionUpdate,
-    StopReason, TextInput, ToolCallId, ToolCallSubject, ToolCallUpdate,
+    AvailableCommand, ConfigOption, ConfigValue, ContentBlock, NoticeSeverity, Open, Patch, PlanId,
+    SessionId, SessionUpdate, StopReason, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use aither_acp::rpc::RpcError;
 use aither_acp::server::{
     MessageStream, PendingPrompt, PromptError, Session, SessionContext, Turn,
 };
+use aither_acp::vendor::codex::SessionModel;
 use async_channel::Receiver;
-use async_lock::Mutex as AsyncMutex;
+use codex_codes::{GetAccountParams, Notification, protocol::methods};
+use codex_sdk::{AppServer, METHOD_NOT_FOUND_CODE, SdkError, ThreadEvent};
+use futures_lite::future::or;
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::app_server::{AppEvent, AppServer};
-use crate::translate;
+use crate::auth::{AuthState, notify_auth_status_cx};
+use crate::convert::{
+    convert_prompt_blocks, emit_notice, emit_notice_from_payload, item_as_tool_call,
+    item_completed_update, output_chunk, patch_update, plan_entries, stop_reason, usage_update,
+};
+use crate::driver::DriverSlot;
+use crate::error::{CodexAcpError, Result};
+use crate::mode::{
+    AcpMode, DEFAULT_REASONING_EFFORT, EFFORT_CONFIG_ID, FAST_MODE_CONFIG_ID, MODE_CONFIG_ID,
+    MODEL_CONFIG_ID, build_available_commands, build_config_options, validate_reasoning_effort,
+};
+use crate::permission::{
+    PermissionMemory, PermissionResolution, SessionRegistry, prompt_session_permission,
+};
 
-/// Config option ids the bridge publishes.
-pub const MODE_CONFIG_ID: &str = "mode";
-/// Model selector config id.
-pub const MODEL_CONFIG_ID: &str = "model";
-/// Reasoning-effort selector config id.
-pub const EFFORT_CONFIG_ID: &str = "reasoning_effort";
-/// Fast-mode toggle config id.
-pub const FAST_MODE_CONFIG_ID: &str = "fast-mode";
-
-/// A session mode: the (approval policy, sandbox policy) preset presented
-/// to the client.
-#[derive(Debug, Clone)]
-pub struct AgentMode {
-    /// Mode id sent on the wire.
-    pub id: &'static str,
-    /// Display name.
-    pub name: &'static str,
-    /// Display description.
-    pub description: &'static str,
-    /// App-server `approvalPolicy`.
-    pub approval_policy: &'static str,
-    /// App-server `approvalsReviewer`.
-    pub approvals_reviewer: &'static str,
-    /// App-server `sandboxPolicy` JSON, or `sandbox` mode name for the modes
-    /// that take a named sandbox.
-    pub sandbox_policy: Value,
-    /// Named `sandbox` value for `thread/start`.
-    pub sandbox_mode: &'static str,
-}
-
-/// The workspace-write sandbox payload shared by two modes.
-fn workspace_write() -> Value {
-    json!({
-        "type": "workspaceWrite",
-        "writableRoots": [],
-        "networkAccess": false,
-        "excludeTmpdirEnvVar": false,
-        "excludeSlashTmp": false,
-    })
-}
-
-/// Every mode the bridge advertises, in display order.
-#[must_use]
-pub fn all_modes() -> Vec<AgentMode> {
-    vec![
-        AgentMode {
-            id: "read-only",
-            name: "Read-only",
-            description: "Requires approval to edit files and access the internet.",
-            approval_policy: "on-request",
-            approvals_reviewer: "user",
-            sandbox_policy: json!({"type": "readOnly", "networkAccess": false}),
-            sandbox_mode: "read-only",
-        },
-        AgentMode {
-            id: "workspace-write",
-            name: "Workspace access",
-            description: "Edit workspace files; ask before writing outside the workspace or accessing the network.",
-            approval_policy: "on-request",
-            approvals_reviewer: "user",
-            sandbox_policy: workspace_write(),
-            sandbox_mode: "workspace-write",
-        },
-        AgentMode {
-            id: "agent",
-            name: "Auto review",
-            description: "Only ask for actions detected as potentially unsafe",
-            approval_policy: "on-request",
-            approvals_reviewer: "auto_review",
-            sandbox_policy: workspace_write(),
-            sandbox_mode: "workspace-write",
-        },
-        AgentMode {
-            id: "agent-full-access",
-            name: "Full access",
-            description: "Unrestricted access to the internet and any file on your computer",
-            approval_policy: "never",
-            approvals_reviewer: "user",
-            sandbox_policy: json!({"type": "dangerFullAccess"}),
-            sandbox_mode: "danger-full-access",
-        },
-    ]
-}
-
-/// The mode applied when the client selects none.
-#[must_use]
-pub fn default_mode() -> AgentMode {
-    AgentMode {
-        id: "agent",
-        name: "Auto review",
-        description: "Only ask for actions detected as potentially unsafe",
-        approval_policy: "on-request",
-        approvals_reviewer: "auto_review",
-        sandbox_policy: workspace_write(),
-        sandbox_mode: "workspace-write",
-    }
-}
-
-/// Look up a mode by wire id.
-#[must_use]
-pub fn find_mode(id: &str) -> Option<AgentMode> {
-    all_modes().into_iter().find(|m| m.id == id)
-}
-
-/// The mutable configuration snapshot of a session.
-#[derive(Debug)]
-pub struct SessionState {
-    /// Current mode id.
-    pub mode: String,
-    /// Model override for the next turn, if set.
-    pub model: Option<String>,
-    /// Reasoning effort override for the next turn, if set.
-    pub effort: Option<String>,
-    /// Fast mode flag for the next turn.
-    pub fast: bool,
-    /// Cached `model/list` entries `(id, display name)`.
-    pub models: Vec<(String, String)>,
-}
-
-impl SessionState {
-    const fn new(mode: String) -> Self {
-        Self {
-            mode,
-            model: None,
-            effort: None,
-            fast: false,
-            models: Vec::new(),
-        }
-    }
-}
-
-fn select_option(value: &str, name: &str, description: Option<&str>) -> SelectOption {
-    SelectOption {
-        value: ConfigValueId::from_string(value),
-        name: name.to_string(),
-        description: description.map(str::to_string),
-        meta: None,
-    }
-}
-
-fn select_config(
-    id: &str,
-    name: &str,
-    description: &str,
-    category: ConfigCategory,
-    current: &str,
-    entries: Vec<SelectOption>,
-) -> ConfigOption {
-    ConfigOption {
-        config_id: ConfigId::from_string(id),
-        name: name.to_string(),
-        description: Some(description.to_string()),
-        category: Some(Open::Known(category)),
-        kind: ConfigKind::Select(SelectConfig {
-            current_value: ConfigValueId::from_string(current),
-            options: SelectOptions::Ungrouped(entries),
-        }),
-        meta: None,
-        extra: BTreeMap::new(),
-    }
-}
-
-fn config_options_of(state: &SessionState) -> Vec<ConfigOption> {
-    let mut options = vec![select_config(
-        MODE_CONFIG_ID,
-        "Mode",
-        "Approval and sandboxing preset for the session",
-        ConfigCategory::Mode,
-        &state.mode,
-        all_modes()
-            .iter()
-            .map(|m| select_option(m.id, m.name, Some(m.description)))
-            .collect(),
-    )];
-    if !state.models.is_empty() {
-        options.push(select_config(
-            MODEL_CONFIG_ID,
-            "Model",
-            "Model used for the next turn",
-            ConfigCategory::Model,
-            state.model.as_deref().unwrap_or(""),
-            state
-                .models
-                .iter()
-                .map(|(id, name)| select_option(id, name, None))
-                .collect(),
-        ));
-    }
-    options.push(select_config(
-        EFFORT_CONFIG_ID,
-        "Reasoning effort",
-        "Reasoning effort for the next turn",
-        ConfigCategory::ThoughtLevel,
-        state.effort.as_deref().unwrap_or(""),
-        ["minimal", "low", "medium", "high", "xhigh"]
-            .into_iter()
-            .map(|e| select_option(e, e, None))
-            .collect(),
-    ));
-    options.push(ConfigOption {
-        config_id: ConfigId::from_string(FAST_MODE_CONFIG_ID),
-        name: "Fast mode".to_string(),
-        description: Some("Prefer speed over cost for the next turn".to_string()),
-        category: Some(Open::Known(ConfigCategory::ModelConfig)),
-        kind: ConfigKind::Boolean(aither_acp::domain::BooleanConfig {
-            current_value: state.fast,
-        }),
-        meta: None,
-        extra: BTreeMap::new(),
-    });
-    options
-}
-
-fn commands() -> Vec<AvailableCommand> {
-    let text_input = |hint: &str| {
-        Some(Open::Known(CommandInput::Text(TextInput {
-            hint: Some(hint.to_string()),
-            meta: None,
-        })))
-    };
-    [
-        ("compact", "Compact the conversation context", None),
-        ("logout", "Sign out of the Codex account", None),
-        ("status", "Show the current account", None),
-        ("review", "Review uncommitted changes", None),
-        (
-            "review-branch",
-            "Review changes against a base branch",
-            text_input("base branch"),
-        ),
-        ("review-commit", "Review a commit", text_input("commit SHA")),
-    ]
-    .into_iter()
-    .map(|(name, description, input)| {
-        AvailableCommand::Command(Command {
-            name: name.to_string(),
-            description: description.to_string(),
-            input,
-            meta: None,
-            extra: BTreeMap::new(),
-        })
-    })
-    .collect()
-}
-
-/// Shared session state behind the cloneable [`CodexSession`] handle.
 struct SessionInner {
-    /// ACP session id assigned by the framework.
     id: SessionId,
-    /// App-server thread id.
     thread_id: String,
-    /// Working directory of the thread.
     cwd: PathBuf,
-    /// Per-thread app-server events.
-    events: Receiver<AppEvent>,
-    server: Arc<AppServer>,
-    /// The host's session table (for `close`/`delete` bookkeeping and
-    /// extension-method lookups).
-    sessions: Arc<AsyncMutex<HashMap<String, CodexSession>>>,
-    /// Mutable config state.
-    state: Mutex<SessionState>,
-    /// Currently running app-server turn id, when a prompt is in flight.
-    active_turn: AsyncMutex<Option<String>>,
+    additional_directories: Vec<PathBuf>,
+    mcp_server_names: Vec<String>,
+    cx: SessionContext,
+    events: Receiver<ThreadEvent>,
+    server: AppServer,
+    driver: Arc<DriverSlot>,
+    auth: Arc<Mutex<AuthState>>,
+    registry: Arc<SessionRegistry>,
+    mode: Mutex<AcpMode>,
+    model: Mutex<Option<String>>,
+    effort: Mutex<Option<String>>,
+    fast_mode: AtomicBool,
+    available_models: Mutex<Vec<SessionModel>>,
+    active_turn: Mutex<Option<String>>,
+    permission_memory: Arc<PermissionMemory>,
 }
 
-/// A live bridge session: one ACP session ↔ one app-server thread.
-///
-/// The handle clones cheaply so the host can keep one in its session
-/// table while the framework owns another.
+/// A live bridge session: one ACP session <-> one `codex app-server` thread.
 #[derive(Clone)]
 pub struct CodexSession {
     inner: Arc<SessionInner>,
 }
 
+impl fmt::Debug for CodexSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexSession")
+            .field("id", &self.inner.id)
+            .field("thread_id", &self.inner.thread_id)
+            .field("cwd", &self.inner.cwd)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CodexSession {
-    /// Build a session around a live thread subscription.
-    #[must_use]
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         id: SessionId,
         thread_id: String,
         cwd: PathBuf,
-        events: Receiver<AppEvent>,
-        server: Arc<AppServer>,
-        sessions: Arc<AsyncMutex<HashMap<String, Self>>>,
-        mode: String,
+        additional_directories: Vec<PathBuf>,
+        mcp_server_names: Vec<String>,
+        cx: SessionContext,
+        events: Receiver<ThreadEvent>,
+        server: AppServer,
+        driver: Arc<DriverSlot>,
+        auth: Arc<Mutex<AuthState>>,
+        registry: Arc<SessionRegistry>,
+        initial_mode: AcpMode,
+        initial_model: Option<String>,
+        initial_effort: Option<String>,
+        available_models: Vec<SessionModel>,
     ) -> Self {
         Self {
             inner: Arc::new(SessionInner {
                 id,
                 thread_id,
                 cwd,
+                additional_directories,
+                mcp_server_names,
+                cx,
                 events,
                 server,
-                sessions,
-                state: Mutex::new(SessionState::new(mode)),
-                active_turn: AsyncMutex::new(None),
+                driver,
+                auth,
+                registry,
+                mode: Mutex::new(initial_mode),
+                model: Mutex::new(initial_model.filter(|s| !s.trim().is_empty())),
+                effort: Mutex::new(initial_effort.filter(|s| !s.trim().is_empty())),
+                fast_mode: AtomicBool::new(false),
+                available_models: Mutex::new(available_models),
+                active_turn: Mutex::new(None),
+                permission_memory: Arc::new(PermissionMemory::new()),
             }),
         }
     }
 
-    /// The ACP session id.
+    /// The ACP session identifier.
     #[must_use]
     pub fn id(&self) -> &SessionId {
         &self.inner.id
     }
 
-    /// The app-server thread id.
+    /// The `codex app-server` thread identifier.
     #[must_use]
     pub fn thread_id(&self) -> &str {
         &self.inner.thread_id
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, SessionState> {
-        self.inner.state.lock().expect("session state poisoned")
+    /// The [`SessionContext`] bound to this session.
+    #[must_use]
+    pub fn context(&self) -> &SessionContext {
+        &self.inner.cx
     }
 
-    /// Update the cached model list (used by `config_options`).
-    pub fn set_models(&self, models: Vec<(String, String)>) {
-        self.state().models = models;
+    pub(crate) fn permission_memory(&self) -> &Arc<PermissionMemory> {
+        &self.inner.permission_memory
     }
 
-    /// Record the thread's initial model/effort.
-    pub fn set_model_effort(&self, model: Option<String>, effort: Option<String>) {
-        let mut s = self.state();
-        s.model = model;
-        s.effort = effort;
-    }
-
-    /// The currently selected model (the legacy `session/set_model` lane).
-    pub fn set_model(&self, model: Option<String>) {
-        self.state().model = model;
-    }
-
-    /// The active app-server turn id, if a turn is running.
-    pub async fn active_turn_id(&self) -> Option<String> {
-        self.inner.active_turn.lock().await.clone()
-    }
-
-    /// Interrupt the running turn, unsubscribe the thread, and detach
-    /// from the host's session table.
-    async fn teardown(&self) {
-        let active = self.inner.active_turn.lock().await.take();
-        if let Some(turn_id) = active {
-            let _ = self
-                .inner
-                .server
-                .call::<_, Value>(
-                    "turn/interrupt",
-                    &json!({"threadId": self.inner.thread_id, "turnId": turn_id}),
-                )
-                .await;
-        }
-        let _ = self
+    /// Current [`AcpMode`] of this session.
+    #[must_use]
+    pub fn current_mode(&self) -> AcpMode {
+        *self
             .inner
-            .server
-            .call::<_, Value>(
-                "thread/unsubscribe",
-                &json!({"threadId": self.inner.thread_id}),
-            )
-            .await;
-        self.inner.server.unsubscribe(&self.inner.thread_id).await;
-        self.inner
-            .sessions
+            .mode
             .lock()
-            .await
-            .remove(self.inner.id.as_str());
-    }
-}
-
-impl Session for CodexSession {
-    fn config_options(&self) -> Vec<ConfigOption> {
-        config_options_of(&self.state())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn available_commands(&self) -> Vec<AvailableCommand> {
-        commands()
+    /// Currently selected model identifier, if any.
+    #[must_use]
+    pub fn current_model(&self) -> Option<String> {
+        self.inner
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
-    fn set_config(
-        &self,
-        id: &ConfigId,
-        value: ConfigValue,
-        _cx: &SessionContext,
-    ) -> impl Future<Output = Result<Vec<ConfigOption>, RpcError>> + Send {
-        std::future::ready(
-            self.set_config_state(id, &value)
-                .map(|()| self.config_options()),
-        )
-    }
-
-    async fn prompt(
-        &self,
-        prompt: PendingPrompt,
-        _cx: &SessionContext,
-    ) -> Result<StopReason, PromptError> {
-        let content = prompt.content().to_vec();
-        let turn = prompt
-            .accept()
-            .await
-            .map_err(|rejected| PromptError::from(rejected.into_inner()))?;
-        if let Some(cmd) = slash_command(&content) {
-            return self.run_command(&turn, &cmd).await;
-        }
-        let (mode, model, effort, fast) = {
-            let s = self.state();
-            (
-                find_mode(&s.mode).unwrap_or_else(default_mode),
-                s.model.clone(),
-                s.effort.clone(),
-                s.fast,
-            )
-        };
-        let input = prompt_input(&content);
-        let resp: Value = self
+    /// Override the selected model identifier (legacy `session/set_model`).
+    pub fn set_model(&self, model: Option<String>) {
+        *self
             .inner
-            .server
-            .call(
-                "turn/start",
-                &json!({
-                    "threadId": self.inner.thread_id,
-                    "input": input,
-                    "cwd": self.inner.cwd.to_string_lossy(),
-                    "model": model,
-                    "effort": effort,
-                    "serviceTierForTurn": fast.then_some("fast"),
-                    "approvalPolicy": mode.approval_policy,
-                    "approvalsReviewer": mode.approvals_reviewer,
-                    "sandboxPolicy": mode.sandbox_policy,
-                }),
-            )
-            .await
-            .map_err(|e| PromptError::failed(e.to_string()))?;
-        let turn_id = resp
-            .get("turn")
-            .and_then(|t| t.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        *self.inner.active_turn.lock().await = Some(turn_id.clone());
-        let stop = self.drive(&turn, &turn_id).await;
-        *self.inner.active_turn.lock().await = None;
-        stop
+            .model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            model.filter(|s| !s.trim().is_empty());
     }
 
-    async fn close(&self) {
-        self.teardown().await;
+    /// Currently selected reasoning effort, if any.
+    #[must_use]
+    pub fn current_effort(&self) -> Option<String> {
+        self.inner
+            .effort
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
-}
 
-impl CodexSession {
-    /// Apply a config change to the session state.
-    fn set_config_state(&self, id: &ConfigId, value: &ConfigValue) -> Result<(), RpcError> {
-        let mut s = self.state();
+    /// Whether fast mode is enabled for upcoming turns.
+    #[must_use]
+    pub fn fast_mode(&self) -> bool {
+        self.inner.fast_mode.load(Ordering::Acquire)
+    }
+
+    /// Currently active app-server `turnId`, when a turn is in flight.
+    #[must_use]
+    pub fn active_turn_id(&self) -> Option<String> {
+        self.inner
+            .active_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_active_turn(&self, turn_id: Option<String>) {
+        *self
+            .inner
+            .active_turn
+            .lock()
+            .expect("active_turn mutex poisoned") = turn_id;
+    }
+
+    pub(crate) fn server(&self) -> &AppServer {
+        &self.inner.server
+    }
+
+    pub(crate) fn driver(&self) -> &Arc<DriverSlot> {
+        &self.inner.driver
+    }
+
+    fn writable_roots(&self) -> Vec<String> {
+        self.inner
+            .additional_directories
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn apply_config_change(&self, id: &ConfigId, value: &ConfigValue) -> Result<()> {
         match id.as_str() {
             MODE_CONFIG_ID => {
-                let mode = config_id_value(value);
-                if find_mode(&mode).is_none() {
-                    return Err(RpcError::invalid_params(format!("unknown mode {mode}")));
-                }
-                s.mode = mode;
+                let raw = config_string_value(value)?;
+                let parsed = AcpMode::parse(&raw)?;
+                *self.inner.mode.lock().expect("session mode mutex poisoned") = parsed;
             }
             MODEL_CONFIG_ID => {
-                s.model = Some(config_id_value(value)).filter(|m| !m.is_empty());
+                let raw = config_string_value(value)?;
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(CodexAcpError::InvalidParams(
+                        "`model` config value must not be empty".to_string(),
+                    ));
+                }
+                self.set_model(Some(trimmed.to_string()));
             }
             EFFORT_CONFIG_ID => {
-                s.effort = Some(config_id_value(value)).filter(|e| !e.is_empty());
+                let raw = config_string_value(value)?;
+                let validated = validate_reasoning_effort(&raw)?;
+                *self
+                    .inner
+                    .effort
+                    .lock()
+                    .expect("session effort mutex poisoned") = Some(validated);
             }
             FAST_MODE_CONFIG_ID => {
-                s.fast = match value {
-                    ConfigValue::Boolean(b) => b.value,
-                    other => {
-                        return Err(RpcError::invalid_params(format!(
-                            "fast-mode expects a boolean value, got {other:?}"
-                        )));
-                    }
-                };
+                let enabled = config_bool_value(value)?;
+                self.inner.fast_mode.store(enabled, Ordering::Release);
             }
             other => {
-                return Err(RpcError::invalid_params(format!(
-                    "unknown config option {other}"
+                return Err(CodexAcpError::InvalidParams(format!(
+                    "unknown config option `{other}`"
                 )));
             }
         }
         Ok(())
     }
+
+    /// Tear down the session: interrupt any running turn, unsubscribe on the
+    /// app-server, and detach from the registry.
+    pub(crate) async fn teardown(&self) {
+        let active = self
+            .inner
+            .active_turn
+            .lock()
+            .expect("active_turn mutex poisoned")
+            .take();
+        if !self.inner.server.is_closed() {
+            if let Some(turn_id) = active {
+                let _ = self
+                    .inner
+                    .driver
+                    .drive_until(self.inner.server.call::<_, Value>(
+                        methods::TURN_INTERRUPT,
+                        &json!({
+                            "threadId": self.inner.thread_id,
+                            "turnId": turn_id,
+                        }),
+                    ))
+                    .await;
+            }
+            let _ = self
+                .inner
+                .driver
+                .drive_until(self.inner.server.call::<_, Value>(
+                    methods::THREAD_UNSUBSCRIBE,
+                    &json!({"threadId": self.inner.thread_id}),
+                ))
+                .await;
+        }
+        self.inner.server.unsubscribe(&self.inner.thread_id);
+        self.inner.registry.remove_session(self.inner.id.as_str());
+    }
 }
 
-/// The selected value of a `ConfigValue::Id`, as a string.
-fn config_id_value(value: &ConfigValue) -> String {
+fn config_string_value(value: &ConfigValue) -> Result<String> {
     match value {
-        ConfigValue::Id(v) => v.value.to_string(),
-        ConfigValue::Boolean(b) => b.value.to_string(),
+        ConfigValue::Id(v) => Ok(v.value.to_string()),
+        ConfigValue::Boolean(b) => Ok(b.value.to_string()),
         ConfigValue::Custom(_, raw) | ConfigValue::Unknown(_, raw) => raw
             .get("value")
             .and_then(Value::as_str)
-            .map_or_else(|| raw.to_string(), str::to_string),
+            .map(str::to_string)
+            .ok_or_else(|| {
+                CodexAcpError::InvalidParams("expected string config value".to_string())
+            }),
     }
 }
 
-/// Map ACP prompt content to app-server `UserInput`s.
-fn prompt_input(prompt: &[ContentBlock]) -> Vec<Value> {
-    let mut input = Vec::new();
-    for block in prompt {
-        match block {
-            ContentBlock::Text(t) => input.push(json!({"type": "text", "text": t.text})),
-            ContentBlock::Image(i) => {
-                let data = i.data.clone().or_else(|| i.uri.clone()).unwrap_or_default();
-                input.push(json!({
-                    "type": "image",
-                    "url": format!("data:{};base64,{}", i.mime_type, data),
-                }));
-            }
-            ContentBlock::ResourceLink(l) => {
-                if let Some(path) = l.uri.strip_prefix("file://") {
-                    input.push(json!({
-                        "type": "mention",
-                        "name": l.name,
-                        "path": path,
-                    }));
-                }
-            }
-            ContentBlock::Resource(res) => {
-                if let ResourceContents::Text(t) = &res.resource {
-                    input.push(json!({"type": "text", "text": t.text}));
-                }
-            }
-            ContentBlock::Audio(a) => input.push(json!({
-                "type": "audio",
-                "url": format!("data:{};base64,{}", a.mime_type, a.data),
-            })),
-            ContentBlock::Custom(..) | ContentBlock::Unknown(..) => {}
-        }
+fn config_bool_value(value: &ConfigValue) -> Result<bool> {
+    match value {
+        ConfigValue::Boolean(b) => Ok(b.value),
+        ConfigValue::Id(v) => match v.value.as_str() {
+            "true" | "on" | "1" => Ok(true),
+            "false" | "off" | "0" => Ok(false),
+            other => Err(CodexAcpError::InvalidParams(format!(
+                "fast-mode expects boolean value, got `{other}`"
+            ))),
+        },
+        other => Err(CodexAcpError::InvalidParams(format!(
+            "fast-mode expects boolean value, got {other:?}"
+        ))),
     }
-    input
 }
 
-/// Whether the prompt is exactly one slash command.
 fn slash_command(prompt: &[ContentBlock]) -> Option<String> {
     if let [ContentBlock::Text(t)] = prompt {
         t.text.trim().strip_prefix('/').map(str::to_string)
@@ -570,26 +333,29 @@ fn slash_command(prompt: &[ContentBlock]) -> Option<String> {
     }
 }
 
-/// Live per-turn emission state.
-struct TurnDrive<'a> {
+struct TurnStreams<'a> {
     turn: &'a Turn,
     agent: Option<MessageStream>,
     thought: Option<MessageStream>,
+    streamed_agent_text: bool,
 }
 
-impl TurnDrive<'_> {
-    fn message(&mut self) -> &MessageStream {
+impl TurnStreams<'_> {
+    async fn agent_text(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.streamed_agent_text = true;
         if self.agent.is_none() {
             self.agent = Some(self.turn.message());
         }
-        self.agent.as_ref().expect("agent stream")
-    }
-
-    async fn agent_text(&mut self, delta: &str) {
-        let _ = self.message().text(delta).await;
+        let _ = self.agent.as_ref().expect("agent stream").text(delta).await;
     }
 
     async fn thought_text(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
         if self.thought.is_none() {
             self.thought = Some(self.turn.thought());
         }
@@ -602,397 +368,649 @@ impl TurnDrive<'_> {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
-enum EventOrCancel {
-    Event(AppEvent),
-    Cancelled,
+impl Session for CodexSession {
+    fn config_options(&self) -> Vec<ConfigOption> {
+        let models = self
+            .inner
+            .available_models
+            .lock()
+            .expect("available_models mutex poisoned")
+            .clone();
+        build_config_options(
+            self.current_mode(),
+            self.current_model().as_deref(),
+            &models,
+            self.current_effort().as_deref(),
+            self.fast_mode(),
+        )
+    }
+
+    fn available_commands(&self) -> Vec<AvailableCommand> {
+        build_available_commands()
+    }
+
+    async fn set_config(
+        &self,
+        id: &ConfigId,
+        value: ConfigValue,
+        cx: &SessionContext,
+    ) -> std::result::Result<Vec<ConfigOption>, RpcError> {
+        self.apply_config_change(id, &value)
+            .map_err(CodexAcpError::into_rpc_error)?;
+        if id.as_str() == MODE_CONFIG_ID && cx.protocol_version().is_v1() {
+            let _ = cx
+                .update(SessionUpdate::CurrentModeUpdate(
+                    aither_acp::domain::CurrentModeUpdate {
+                        current_mode_id: aither_acp::domain::ConfigValueId::from_string(
+                            self.current_mode().as_str(),
+                        ),
+                        meta: None,
+                        extra: std::collections::BTreeMap::new(),
+                    },
+                ))
+                .await;
+        }
+        Ok(self.config_options())
+    }
+
+    async fn prompt(
+        &self,
+        prompt: PendingPrompt,
+        cx: &SessionContext,
+    ) -> std::result::Result<StopReason, PromptError> {
+        let content = prompt.content().to_vec();
+        if let Err(err) = validate_prompt_blocks(&content) {
+            let rpc = err.into_rpc_error();
+            prompt.reject(rpc.clone()).await;
+            return Err(PromptError::from(rpc));
+        }
+
+        let turn = prompt
+            .accept()
+            .await
+            .map_err(|rejected| PromptError::from(rejected.into_inner()))?;
+
+        if let Some(cmd) = slash_command(&content) {
+            return Box::pin(self.run_command(&turn, cx, &cmd))
+                .await
+                .map_err(CodexAcpError::into_prompt_error);
+        }
+
+        let input = convert_prompt_blocks(&content).map_err(CodexAcpError::into_prompt_error)?;
+        let mode = self.current_mode();
+        let model = self.current_model();
+        let effort = self.current_effort();
+        let fast = self.fast_mode();
+        let roots = self.writable_roots();
+
+        let start_params = json!({
+            "threadId": self.inner.thread_id,
+            "input": input,
+            "cwd": self.inner.cwd.to_string_lossy(),
+            "model": model,
+            "effort": effort,
+            "serviceTierForTurn": fast.then_some("fast"),
+            "approvalPolicy": mode.approval_policy_str(),
+            "approvalsReviewer": mode.approvals_reviewer_str(),
+            "sandboxPolicy": mode.sandbox_policy_json(&roots),
+        });
+
+        let resp: Value = self
+            .inner
+            .driver
+            .drive_until(self.inner.server.call(methods::TURN_START, &start_params))
+            .await
+            .map_err(|e| CodexAcpError::Sdk(e).into_prompt_error())?;
+
+        let turn_id = resp
+            .get("turn")
+            .and_then(|t| t.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        self.set_active_turn(Some(turn_id.clone()));
+        let res = Box::pin(self.drive_turn(&turn, cx, &turn_id)).await;
+        self.set_active_turn(None);
+        res.map_err(CodexAcpError::into_prompt_error)
+    }
+
+    async fn close(&self) {
+        self.teardown().await;
+    }
+}
+
+fn validate_prompt_blocks(content: &[ContentBlock]) -> Result<()> {
+    if slash_command(content).is_some() {
+        return Ok(());
+    }
+    let _ = convert_prompt_blocks(content)?;
+    Ok(())
 }
 
 impl CodexSession {
-    /// Consume session events until the turn ends; translate + forward them.
-    async fn drive(&self, turn: &Turn, turn_id: &str) -> Result<StopReason, PromptError> {
-        let mut d = TurnDrive {
+    async fn drive_turn(
+        &self,
+        turn: &Turn,
+        cx: &SessionContext,
+        turn_id: &str,
+    ) -> Result<StopReason> {
+        enum Next {
+            Steered(Box<PendingPrompt>),
+            Event(Option<Box<ThreadEvent>>),
+            Cancelled,
+        }
+
+        let mut streams = TurnStreams {
             turn,
             agent: None,
             thought: None,
+            streamed_agent_text: false,
         };
-        loop {
-            // Absorb prompts queued mid-turn (v2 clients prompt freely).
-            while let Some(steered) = turn.try_recv_steered() {
-                self.steer(turn, steered).await;
-            }
-            let ev = futures_lite::future::or(
-                async { self.inner.events.recv().await.map(EventOrCancel::Event) },
-                async {
-                    turn.cancelled().await;
-                    Ok(EventOrCancel::Cancelled)
-                },
-            )
-            .await
-            .map_err(|_| PromptError::failed("app-server event channel closed"))?;
-            let ev = match ev {
-                EventOrCancel::Cancelled => {
-                    let _ = self
-                        .inner
-                        .server
-                        .call::<_, Value>(
-                            "turn/interrupt",
-                            &json!({"threadId": self.inner.thread_id, "turnId": turn_id}),
-                        )
-                        .await;
-                    return Ok(StopReason::Cancelled);
-                }
-                EventOrCancel::Event(e) => e,
-            };
-            match ev {
-                AppEvent::Notification(n) => {
-                    if let Some(stop) = self.forward(&mut d, &n, turn_id).await {
-                        return Ok(stop);
+
+        self.inner
+            .driver
+            .drive_until(async {
+                loop {
+                    while let Some(steered) = turn.try_recv_steered() {
+                        self.steer_queued(turn, cx, turn_id, steered).await;
+                    }
+
+                    let next = or(
+                        std::future::poll_fn(|_| {
+                            turn.try_recv_steered()
+                                .map_or(std::task::Poll::Pending, |p| {
+                                    std::task::Poll::Ready(Next::Steered(Box::new(p)))
+                                })
+                        }),
+                        or(
+                            async {
+                                Next::Event(self.inner.events.recv().await.ok().map(Box::new))
+                            },
+                            async {
+                                turn.cancelled().await;
+                                Next::Cancelled
+                            },
+                        ),
+                    )
+                    .await;
+
+                    match next {
+                        Next::Steered(steered) => {
+                            self.steer_queued(turn, cx, turn_id, *steered).await;
+                        }
+                        Next::Cancelled => {
+                            let _ = self
+                                .inner
+                                .server
+                                .call::<_, Value>(
+                                    methods::TURN_INTERRUPT,
+                                    &json!({
+                                        "threadId": self.inner.thread_id,
+                                        "turnId": turn_id,
+                                    }),
+                                )
+                                .await;
+                            return Ok(StopReason::Cancelled);
+                        }
+                        Next::Event(None) => {
+                            if turn.is_cancelled() {
+                                return Ok(StopReason::Cancelled);
+                            }
+                            if let Some(exit_err) = self.inner.server.terminal_error() {
+                                return Err(CodexAcpError::Sdk(exit_err));
+                            }
+                            return Err(CodexAcpError::Sdk(SdkError::Closed));
+                        }
+                        Next::Event(Some(ev)) => {
+                            if let Some(ev_turn) = ev.turn_id()
+                                && !ev_turn.is_empty()
+                                && ev_turn != turn_id
+                            {
+                                continue;
+                            }
+                            if let Some(stop) =
+                                self.forward_event(&mut streams, cx, turn_id, *ev).await?
+                            {
+                                return Ok(stop);
+                            }
+                        }
                     }
                 }
-                AppEvent::Request { id, request } => {
-                    self.answer_request(turn, id, request).await;
-                }
-                AppEvent::Unknown { id: Some(id), .. } => {
-                    let _ = self
-                        .inner
-                        .server
-                        .respond_error(&id, -32601, "request unsupported by this bridge")
-                        .await;
-                }
-                AppEvent::Unknown { .. } => {}
-            }
-        }
+            })
+            .await
     }
 
-    /// Merge a queued prompt into the running turn and forward it to the
-    /// app-server's `turn/steer`.
-    async fn steer(&self, turn: &Turn, steered: PendingPrompt) {
-        let input = prompt_input(steered.content());
-        let Some(codex_turn) = self.inner.active_turn.lock().await.clone() else {
-            steered
-                .reject(RpcError::invalid_params("no active turn to steer"))
-                .await;
-            return;
+    async fn steer_queued(
+        &self,
+        turn: &Turn,
+        cx: &SessionContext,
+        turn_id: &str,
+        steered: PendingPrompt,
+    ) {
+        let input = match convert_prompt_blocks(steered.content()) {
+            Ok(inp) => inp,
+            Err(err) => {
+                steered.reject(err.into_rpc_error()).await;
+                return;
+            }
         };
-        if let Err(e) = turn.merge_prompt(steered).await {
-            debug!(%e, "steered prompt already resolved");
+        if let Err(err) = turn.merge_prompt(steered).await {
+            debug!(%err, "steered prompt already resolved");
             return;
         }
-        if let Err(e) = self
+        if let Err(err) = self
             .inner
             .server
             .call::<_, Value>(
-                "turn/steer",
+                methods::TURN_STEER,
                 &json!({
                     "threadId": self.inner.thread_id,
-                    "expectedTurnId": codex_turn,
+                    "expectedTurnId": turn_id,
                     "input": input,
                 }),
             )
             .await
         {
-            let _ = turn
-                .notice(
-                    Open::Known(NoticeSeverity::Warning),
-                    "Steering failed",
-                    Some(e.to_string()),
-                )
-                .await;
+            emit_notice(
+                cx,
+                NoticeSeverity::Warning,
+                "Steering failed",
+                Some(err.to_string()),
+            )
+            .await;
         }
     }
 
-    /// Returns `Some(stop_reason)` when the turn finished.
-    async fn forward(
+    async fn forward_event(
         &self,
-        d: &mut TurnDrive<'_>,
-        n: &codex_codes::Notification,
+        streams: &mut TurnStreams<'_>,
+        cx: &SessionContext,
         turn_id: &str,
-    ) -> Option<StopReason> {
-        use codex_codes::Notification as N;
-        // Skip turn-scoped leftovers from another turn.
-        if let Some(tid) = n.turn_id()
-            && !tid.is_empty()
-            && tid != turn_id
-        {
-            return None;
+        ev: ThreadEvent,
+    ) -> Result<Option<StopReason>> {
+        match ev {
+            ThreadEvent::Notification(n) => self.forward_typed(streams, cx, turn_id, n).await,
+            ThreadEvent::RawNotification { method, params } => {
+                self.forward_raw(streams, cx, turn_id, &method, &params)
+                    .await
+            }
         }
-        match n {
-            N::AgentMessageDelta(delta) => d.agent_text(&delta.delta).await,
-            N::ReasoningDelta(delta) => d.thought_text(&delta.delta).await,
-            N::ReasoningTextDelta(delta) => d.thought_text(&delta.delta).await,
-            N::PlanDelta(delta) => d.agent_text(&delta.delta).await,
-            N::CmdOutputDelta(_)
-            | N::FileChangeOutputDelta(_)
-            | N::FileChangePatchUpdated(_)
-            | N::ItemStarted(_)
-            | N::ItemCompleted(_) => Self::emit_tool(d, n).await,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn forward_typed(
+        &self,
+        streams: &mut TurnStreams<'_>,
+        cx: &SessionContext,
+        turn_id: &str,
+        notification: Notification,
+    ) -> Result<Option<StopReason>> {
+        use Notification as N;
+        match notification {
+            N::AgentMessageDelta(d) => streams.agent_text(&d.delta).await,
+            N::ReasoningDelta(d) => streams.thought_text(&d.delta).await,
+            N::ReasoningTextDelta(d) => streams.thought_text(&d.delta).await,
+            N::PlanDelta(d) => streams.agent_text(&d.delta).await,
+            N::CmdOutputDelta(d) => {
+                let _ = streams
+                    .turn
+                    .update(SessionUpdate::ToolCallContentChunk(output_chunk(
+                        &d.item_id, &d.delta,
+                    )))
+                    .await;
+            }
+            N::FileChangeOutputDelta(d) => {
+                let _ = streams
+                    .turn
+                    .update(SessionUpdate::ToolCallContentChunk(output_chunk(
+                        &d.item_id, &d.delta,
+                    )))
+                    .await;
+            }
+            N::FileChangePatchUpdated(d) => {
+                let changes = serde_json::to_value(&d.changes).unwrap_or_default();
+                let slice = changes.as_array().map_or(&[][..], Vec::as_slice);
+                let _ = streams
+                    .turn
+                    .update(SessionUpdate::ToolCallUpdate(patch_update(
+                        &d.item_id, slice,
+                    )))
+                    .await;
+            }
+            N::ItemStarted(n) => {
+                let v = serde_json::to_value(&n.item).unwrap_or_default();
+                if let Some(u) = item_as_tool_call(&v, Some(ToolCallStatus::InProgress)) {
+                    let _ = streams.turn.update(SessionUpdate::ToolCallUpdate(u)).await;
+                }
+            }
+            N::ItemCompleted(n) => {
+                let v = serde_json::to_value(&n.item).unwrap_or_default();
+                self.emit_completed_item(streams, &v).await;
+            }
             N::TurnPlanUpdated(plan) => {
-                let v = serde_json::to_value(plan).unwrap_or_default();
+                let v = serde_json::to_value(&plan).unwrap_or_default();
                 let plan_id = v
                     .get("planId")
                     .or_else(|| v.get("id"))
                     .and_then(Value::as_str)
                     .map_or_else(|| PlanId::from_string("turn-plan"), PlanId::from_string);
-                let _ = d.turn.plan(plan_id, translate::plan_entries(&v)).await;
+                let _ = streams.turn.plan(plan_id, plan_entries(&v)).await;
+            }
+            N::ThreadTokenUsageUpdated(n) => {
+                let v = serde_json::to_value(&n.token_usage).unwrap_or_default();
+                let _ = cx.usage(usage_update(&v)).await;
+            }
+            N::Error(e) => {
+                let v = serde_json::to_value(&e).unwrap_or_default();
+                emit_notice_from_payload(cx, NoticeSeverity::Error, &v).await;
+            }
+            N::Warning(e) => {
+                let v = serde_json::to_value(&e).unwrap_or_default();
+                emit_notice_from_payload(cx, NoticeSeverity::Warning, &v).await;
+            }
+            N::ConfigWarning(e) => {
+                let v = serde_json::to_value(&e).unwrap_or_default();
+                emit_notice_from_payload(cx, NoticeSeverity::Warning, &v).await;
+            }
+            N::GuardianWarning(e) => {
+                let v = serde_json::to_value(&e).unwrap_or_default();
+                emit_notice_from_payload(cx, NoticeSeverity::Warning, &v).await;
+            }
+            N::StrictReviewRequired(n) => {
+                self.handle_strict_review_required(cx, &n.turn_id).await;
+            }
+            N::ContextCompacted(n) => {
+                let v = serde_json::to_value(&n).unwrap_or_default();
+                emit_notice(
+                    cx,
+                    NoticeSeverity::Info,
+                    "Context compacted",
+                    v.get("turnId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                )
+                .await;
             }
             N::TurnCompleted(n) => {
                 let v = serde_json::to_value(&n.turn).unwrap_or_default();
                 let completed_id = v.get("id").and_then(Value::as_str).unwrap_or_default();
                 if !completed_id.is_empty() && completed_id != turn_id {
-                    return None;
+                    return Ok(None);
                 }
-                return Some(translate::stop_reason(&v));
+                return Ok(Some(stop_reason(&v)));
             }
-            N::ThreadTokenUsageUpdated(n) => {
-                let v = serde_json::to_value(&n.token_usage).unwrap_or_default();
-                let _ = d.turn.context().usage(translate::usage_update(&v)).await;
-            }
-            N::Error(e) => {
-                notice(d.turn, NoticeSeverity::Error, e).await;
-            }
-            N::Warning(e) => {
-                notice(d.turn, NoticeSeverity::Warning, e).await;
-            }
-            N::ConfigWarning(e) => {
-                notice(d.turn, NoticeSeverity::Warning, e).await;
-            }
-            N::GuardianWarning(e) => {
-                notice(d.turn, NoticeSeverity::Warning, e).await;
-            }
-            N::ContextCompacted(n) => {
-                let v = serde_json::to_value(n).unwrap_or_default();
-                let _ = d
-                    .turn
-                    .notice(
-                        Open::Known(NoticeSeverity::Info),
-                        "Context compacted",
-                        v.get("turnId").and_then(Value::as_str).map(str::to_string),
-                    )
-                    .await;
+            N::Unknown { method, params } => {
+                let p = params.unwrap_or(Value::Null);
+                return self.forward_raw(streams, cx, turn_id, &method, &p).await;
             }
             _ => {}
         }
-        None
+        Ok(None)
     }
 
-    /// Emit a tool-call update for item lifecycle notifications.
-    async fn emit_tool(d: &TurnDrive<'_>, n: &codex_codes::Notification) {
-        use codex_codes::Notification as N;
-        let update = match n {
-            N::CmdOutputDelta(delta) => SessionUpdate::ToolCallContentChunk(
-                translate::output_chunk(&delta.item_id, &delta.delta),
-            ),
-            N::FileChangeOutputDelta(delta) => {
-                let v = serde_json::to_value(delta).unwrap_or_default();
-                let text = v.get("delta").and_then(Value::as_str).unwrap_or_default();
-                SessionUpdate::ToolCallContentChunk(translate::output_chunk(&delta.item_id, text))
-            }
-            N::FileChangePatchUpdated(delta) => {
-                let changes = serde_json::to_value(&delta.changes).unwrap_or_default();
-                SessionUpdate::ToolCallUpdate(translate::patch_update(
-                    &delta.item_id,
-                    changes.as_array().map_or(&[], Vec::as_slice),
-                ))
-            }
-            N::ItemStarted(n) => {
-                let v = serde_json::to_value(&n.item).unwrap_or_default();
-                let status = aither_acp::domain::ToolCallStatus::InProgress;
-                match translate::item_as_tool_call(&v, Some(status)) {
-                    Some(u) => SessionUpdate::ToolCallUpdate(u),
-                    None => return,
+    #[allow(clippy::too_many_lines)]
+    async fn forward_raw(
+        &self,
+        streams: &mut TurnStreams<'_>,
+        cx: &SessionContext,
+        turn_id: &str,
+        method: &str,
+        params: &Value,
+    ) -> Result<Option<StopReason>> {
+        match method {
+            "item/agentMessage/delta" => {
+                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                    streams.agent_text(delta).await;
                 }
             }
-            N::ItemCompleted(n) => {
-                let v = serde_json::to_value(&n.item).unwrap_or_default();
-                match translate::item_completed_update(&v) {
-                    Some(u) => SessionUpdate::ToolCallUpdate(u),
-                    None => return,
+            "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                    streams.thought_text(delta).await;
                 }
             }
-            _ => return,
-        };
-        let _ = d.turn.update(update).await;
+            "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
+                let id = params
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let delta = params
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !id.is_empty() {
+                    let _ = streams
+                        .turn
+                        .update(SessionUpdate::ToolCallContentChunk(output_chunk(id, delta)))
+                        .await;
+                }
+            }
+            "item/fileChange/patchUpdated" => {
+                let id = params
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let changes = params
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .map_or(&[][..], Vec::as_slice);
+                if !id.is_empty() {
+                    let _ = streams
+                        .turn
+                        .update(SessionUpdate::ToolCallUpdate(patch_update(id, changes)))
+                        .await;
+                }
+            }
+            "item/started" => {
+                if let Some(item) = params.get("item")
+                    && let Some(u) = item_as_tool_call(item, Some(ToolCallStatus::InProgress))
+                {
+                    let _ = streams.turn.update(SessionUpdate::ToolCallUpdate(u)).await;
+                }
+            }
+            "item/completed" => {
+                if let Some(item) = params.get("item") {
+                    self.emit_completed_item(streams, item).await;
+                }
+            }
+            "turn/plan/updated" => {
+                let plan_id = params
+                    .get("planId")
+                    .or_else(|| params.get("id"))
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PlanId::from_string("turn-plan"), PlanId::from_string);
+                let _ = streams.turn.plan(plan_id, plan_entries(params)).await;
+            }
+            "thread/tokenUsage/updated" => {
+                let token_usage = params.get("tokenUsage").unwrap_or(params);
+                let _ = cx.usage(usage_update(token_usage)).await;
+            }
+            "error" => emit_notice_from_payload(cx, NoticeSeverity::Error, params).await,
+            "warning" | "configWarning" => {
+                emit_notice_from_payload(cx, NoticeSeverity::Warning, params).await;
+            }
+            "autoApprovalReview/strictReviewRequired" => {
+                let tid = params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(turn_id);
+                self.handle_strict_review_required(cx, tid).await;
+            }
+            "thread/compacted" => {
+                emit_notice(
+                    cx,
+                    NoticeSeverity::Info,
+                    "Context compacted",
+                    params
+                        .get("turnId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                )
+                .await;
+            }
+            "turn/completed" => {
+                let turn = params.get("turn").unwrap_or(params);
+                let completed_id = turn.get("id").and_then(Value::as_str).unwrap_or_default();
+                if !completed_id.is_empty() && completed_id != turn_id {
+                    return Ok(None);
+                }
+                return Ok(Some(stop_reason(turn)));
+            }
+            _ => {}
+        }
+        Ok(None)
     }
 
-    /// Forward an app-server approval/elicitation request to the ACP client.
-    async fn answer_request(&self, turn: &Turn, id: Value, request: codex_codes::ServerRequest) {
-        use codex_codes::ServerRequest as R;
-        match request {
-            R::CmdExecApproval(p) => {
-                let raw = serde_json::to_value(&p).unwrap_or_default();
-                let decision = self.ask(turn, "Run command?", &raw).await;
-                let _ = self
-                    .inner
-                    .server
-                    .respond(&id, &json!({"decision": decision}))
+    async fn handle_strict_review_required(&self, cx: &SessionContext, turn_id: &str) {
+        emit_notice(
+            cx,
+            NoticeSeverity::Warning,
+            "Strict review required",
+            Some("Auto-review escalated this turn to manual permission approval.".to_string()),
+        )
+        .await;
+        if self.current_mode() == AcpMode::Agent {
+            let mut call =
+                ToolCallUpdate::new(ToolCallId::from_string(format!("strict-review-{turn_id}")));
+            call.title = Patch::Set("Continue after strict review escalation?".to_string());
+            call.kind = Patch::Set(Open::Known(ToolKind::Other));
+            call.status = Patch::Set(Open::Known(ToolCallStatus::Pending));
+            let resolution =
+                prompt_session_permission(self, "strict_review", Some(turn_id.to_string()), call)
                     .await;
-            }
-            R::ExecCommandApproval(p) => {
-                let raw = serde_json::to_value(&p).unwrap_or_default();
-                let decision = self.ask(turn, "Run command?", &raw).await;
+            if matches!(
+                resolution,
+                PermissionResolution::RejectOnce
+                    | PermissionResolution::RejectAlways
+                    | PermissionResolution::Cancelled
+            ) {
                 let _ = self
                     .inner
                     .server
-                    .respond(&id, &json!({"decision": decision}))
-                    .await;
-            }
-            R::FileChangeApproval(p) => {
-                let raw = serde_json::to_value(&p).unwrap_or_default();
-                let decision = self.ask(turn, "Apply file changes?", &raw).await;
-                let _ = self
-                    .inner
-                    .server
-                    .respond(&id, &json!({"decision": decision}))
-                    .await;
-            }
-            R::ApplyPatchApproval(p) => {
-                let raw = serde_json::to_value(&p).unwrap_or_default();
-                let decision = self.ask(turn, "Apply file changes?", &raw).await;
-                let _ = self
-                    .inner
-                    .server
-                    .respond(&id, &json!({"decision": decision}))
-                    .await;
-            }
-            R::McpServerElicitationRequest(_) => {
-                let _ = self
-                    .inner
-                    .server
-                    .respond(&id, &json!({"action": "decline"}))
-                    .await;
-            }
-            other => {
-                debug!(
-                    ?other,
-                    "answering unsupported server request with a refusal"
-                );
-                let _ = self
-                    .inner
-                    .server
-                    .respond_error(&id, -32601, "request unsupported by this bridge")
+                    .call::<_, Value>(
+                        methods::TURN_INTERRUPT,
+                        &json!({
+                            "threadId": self.inner.thread_id,
+                            "turnId": turn_id,
+                        }),
+                    )
                     .await;
             }
         }
     }
 
-    /// Ask the client for permission; returns the app-server decision.
-    async fn ask(&self, turn: &Turn, title: &str, raw: &Value) -> &'static str {
-        let options = [
-            (
-                "allow_always",
-                "Always allow",
-                PermissionOptionKind::AllowAlways,
-            ),
-            ("allow", "Allow once", PermissionOptionKind::AllowOnce),
-            ("reject", "Reject", PermissionOptionKind::RejectOnce),
-            (
-                "reject_always",
-                "Always reject",
-                PermissionOptionKind::RejectAlways,
-            ),
-        ]
-        .into_iter()
-        .map(|(id, name, kind)| PermissionOption {
-            option_id: aither_acp::domain::PermissionOptionId::from_string(id),
-            name: name.to_string(),
-            kind: Open::Known(kind),
-            meta: None,
-            extra: BTreeMap::new(),
-        })
-        .collect();
-        let mut subject = ToolCallUpdate::new(ToolCallId::from_string(
-            raw.get("itemId")
-                .and_then(Value::as_str)
-                .unwrap_or("approval"),
-        ));
-        subject.title = Patch::Set(title.to_string());
-        subject.raw_input = Patch::Set(raw.clone());
-        let request = PermissionRequest {
-            session_id: self.inner.id.clone(),
-            title: title.to_string(),
-            description: None,
-            subject: Some(Open::Known(PermissionSubject::ToolCall(Box::new(
-                ToolCallSubject {
-                    tool_call: subject,
-                    meta: None,
-                    extra: BTreeMap::new(),
-                },
-            )))),
-            options,
-            meta: None,
-            extra: BTreeMap::new(),
-        };
-        match turn.confirm(request).await {
-            Ok(PermissionOutcome::Selected(sel)) => match sel.option_id.as_str() {
-                "allow_always" => "acceptForSession",
-                "allow" => "accept",
-                "reject" | "reject_always" => "decline",
-                _ => "cancel",
-            },
-            _ => "cancel",
+    async fn emit_completed_item(&self, streams: &mut TurnStreams<'_>, item: &Value) {
+        let p = item.get("payload").unwrap_or(item);
+        if p.get("type").and_then(Value::as_str) == Some("agentMessage") {
+            if !streams.streamed_agent_text
+                && let Some(text) = p
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            {
+                streams.agent_text(text).await;
+            }
+            return;
+        }
+        if let Some(u) = item_completed_update(item) {
+            let _ = streams.turn.update(SessionUpdate::ToolCallUpdate(u)).await;
         }
     }
 
-    /// A `/`-command prompt: run the codex-side action and report as updates.
-    async fn run_command(&self, turn: &Turn, cmd: &str) -> Result<StopReason, PromptError> {
+    #[allow(clippy::too_many_lines)]
+    async fn run_command(&self, turn: &Turn, cx: &SessionContext, cmd: &str) -> Result<StopReason> {
         let (name, args) = cmd.split_once(' ').unwrap_or((cmd, ""));
         match name {
             "compact" => {
                 let _: Value = self
                     .inner
-                    .server
-                    .call(
-                        "thread/compact/start",
+                    .driver
+                    .drive_until(self.inner.server.call(
+                        methods::THREAD_COMPACT_START,
                         &json!({"threadId": self.inner.thread_id}),
-                    )
-                    .await
-                    .map_err(|e| PromptError::failed(e.to_string()))?;
+                    ))
+                    .await?;
                 Ok(StopReason::EndTurn)
             }
             "logout" => {
-                let _: Value = self
+                match self
                     .inner
-                    .server
-                    .call("account/logout", &json!({}))
+                    .driver
+                    .drive_until(self.inner.server.account_logout())
                     .await
-                    .map_err(|e| PromptError::failed(e.to_string()))?;
+                {
+                    Ok(_) => {}
+                    Err(SdkError::Remote(rem)) if rem.code == METHOD_NOT_FOUND_CODE => {}
+                    Err(err) => return Err(CodexAcpError::Sdk(err)),
+                }
+                let status = self
+                    .inner
+                    .auth
+                    .lock()
+                    .expect("auth mutex poisoned")
+                    .set_logged_out();
+                notify_auth_status_cx(cx, &status).await?;
                 Ok(StopReason::EndTurn)
             }
             "status" => {
-                let v: Value = self
+                let account_detail = match self
                     .inner
-                    .server
-                    .call("account/read", &json!({}))
+                    .driver
+                    .drive_until(self.inner.server.account_read(&GetAccountParams {
+                        refresh_token: None,
+                    }))
                     .await
-                    .unwrap_or_default();
-                let _ = turn.message().text(format!("Account: {v}")).await;
+                {
+                    Ok(resp) => resp
+                        .account
+                        .and_then(|acc| serde_json::to_string(&acc).ok()),
+                    Err(_) => None,
+                };
+                let report = self.format_status_report(account_detail.as_deref());
+                let _ = turn.message().text(report).await;
                 Ok(StopReason::EndTurn)
             }
             "review" | "review-branch" | "review-commit" => {
+                let trimmed = args.trim();
                 let target = match name {
-                    "review-branch" => json!({"type": "baseBranch", "branch": args.trim()}),
-                    "review-commit" => json!({"type": "commit", "sha": args.trim()}),
+                    "review-branch" => {
+                        if trimmed.is_empty() {
+                            return Err(CodexAcpError::InvalidParams(
+                                "`/review-branch` requires a branch name".to_string(),
+                            ));
+                        }
+                        json!({"type": "baseBranch", "branch": trimmed})
+                    }
+                    "review-commit" => {
+                        if trimmed.is_empty() {
+                            return Err(CodexAcpError::InvalidParams(
+                                "`/review-commit` requires a commit SHA".to_string(),
+                            ));
+                        }
+                        json!({"type": "commit", "sha": trimmed})
+                    }
                     _ => json!({"type": "uncommittedChanges"}),
                 };
                 let resp: Value = self
                     .inner
-                    .server
-                    .call(
-                        "review/start",
-                        &json!({"threadId": self.inner.thread_id, "target": target}),
-                    )
-                    .await
-                    .map_err(|e| PromptError::failed(e.to_string()))?;
+                    .driver
+                    .drive_until(self.inner.server.call(
+                        methods::REVIEW_START,
+                        &json!({
+                            "threadId": self.inner.thread_id,
+                            "target": target,
+                        }),
+                    ))
+                    .await?;
                 let turn_id = resp
                     .get("turn")
                     .and_then(|t| t.get("id"))
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                *self.inner.active_turn.lock().await = Some(turn_id.clone());
-                let stop = self.drive(turn, &turn_id).await;
-                *self.inner.active_turn.lock().await = None;
+                self.set_active_turn(Some(turn_id.clone()));
+                let stop = Box::pin(self.drive_turn(turn, cx, &turn_id)).await;
+                self.set_active_turn(None);
                 stop
             }
             _ => {
@@ -1004,21 +1022,46 @@ impl CodexSession {
             }
         }
     }
-}
 
-/// Emit a session notice for a codex error/warning payload.
-async fn notice(turn: &Turn, severity: NoticeSeverity, e: &(impl serde::Serialize + Sync)) {
-    let v = serde_json::to_value(e).unwrap_or_default();
-    let _ = turn
-        .notice(
-            Open::Known(severity),
-            v.get("message")
-                .or_else(|| v.get("error").and_then(|e| e.get("message")))
-                .and_then(Value::as_str)
-                .unwrap_or("notification"),
-            v.get("additionalDetails")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+    fn format_status_report(&self, account_detail: Option<&str>) -> String {
+        let mode = self.current_mode();
+        let model = self
+            .current_model()
+            .unwrap_or_else(|| "default".to_string());
+        let effort = self
+            .current_effort()
+            .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string());
+        let fast = self.fast_mode();
+        let auth_status = self
+            .inner
+            .auth
+            .lock()
+            .expect("auth mutex poisoned")
+            .status();
+        let auth_desc = account_detail.map_or_else(
+            || {
+                auth_status.label.as_deref().map_or_else(
+                    || auth_status.kind.as_str().to_string(),
+                    |lbl| format!("{} ({lbl})", auth_status.kind.as_str()),
+                )
+            },
+            ToOwned::to_owned,
+        );
+        let mcp = if self.inner.mcp_server_names.is_empty() {
+            "none".to_string()
+        } else {
+            self.inner.mcp_server_names.join(", ")
+        };
+        format!(
+            "Session: {}\nDirectory: {}\nMode: {}\nModel: {}\nReasoning effort: {}\nFast mode: {}\nAccount: {}\nMCP servers: {}",
+            self.inner.id,
+            self.inner.cwd.display(),
+            mode.as_str(),
+            model,
+            effort,
+            fast,
+            auth_desc,
+            mcp,
         )
-        .await;
+    }
 }
