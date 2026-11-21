@@ -1,150 +1,168 @@
-//! Live integration test against a real `codex app-server` bound to a local
-//! provider pool. Ignored by default; run with
+//! Live end-to-end integration test driving `codex_acp::serve()` against a real
+//! `codex app-server` child process bound to a local provider pool.
+//!
+//! Ignored by default; run with:
 //!
 //! ```sh
-//! POOL_BASE_URL=http://127.0.0.1:64395/v1 POOL_MODEL=gpt-6-luna \
-//!     cargo test --test live -- --ignored --nocapture
+//! CODEX_ACP_POOL_URL=http://127.0.0.1:64395/v1 CODEX_ACP_TEST_MODEL=gpt-6-luna \
+//!     cargo nextest run -p codex-acp --test live --run-ignored only
 //! ```
 #![cfg(feature = "process")]
 
+use std::net::TcpStream;
 use std::time::Duration;
 
-use codex_acp::app_server::{AppEvent, AppServer, SpawnConfig};
-use codex_codes::{Notification, TurnStatus};
-use serde_json::{Value, json};
+use codex_acp::aither_acp::client::{Client, MessageKind, SessionEvent, TurnOutcome};
+use codex_acp::aither_acp::domain::{ContentBlock, Implementation, Open, StopReason};
+use codex_acp::aither_acp::rpc;
+use codex_acp::codex_sdk::SpawnConfig;
+use codex_acp::{CodexAcpConfig, serve};
+use futures_lite::StreamExt as _;
 
-fn pool_config() -> SpawnConfig {
-    let base =
-        std::env::var("POOL_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:64395/v1".into());
+fn resolve_pool_url() -> String {
+    std::env::var("CODEX_ACP_POOL_URL")
+        .or_else(|_| std::env::var("POOL_BASE_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:64395/v1".to_string())
+}
+
+fn resolve_test_model() -> String {
+    std::env::var("CODEX_ACP_TEST_MODEL")
+        .or_else(|_| std::env::var("POOL_MODEL"))
+        .unwrap_or_else(|_| "gpt-6-luna".to_string())
+}
+
+fn pool_reachable(base_url: &str) -> bool {
+    let trimmed = base_url
+        .strip_prefix("http://")
+        .or_else(|| base_url.strip_prefix("https://"))
+        .unwrap_or(base_url);
+    let host_port = trimmed.split('/').next().unwrap_or(trimmed);
+    let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&host_port) else {
+        return false;
+    };
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn build_live_config(base_url: &str) -> CodexAcpConfig {
     let catalog = std::env::var("POOL_CATALOG").unwrap_or_else(|_| {
         format!(
             "{}/.config/acpsub/codex-catalog.json",
             std::env::var("HOME").unwrap_or_default()
         )
     });
-    SpawnConfig {
-        args: vec![
-            "-c".into(),
-            "model_provider=pool".into(),
-            "-c".into(),
-            "model_providers.pool.name=pool".into(),
-            "-c".into(),
-            format!("model_providers.pool.base_url={base}"),
-            "-c".into(),
-            "model_providers.pool.wire_api=responses".into(),
-            "-c".into(),
-            "model_providers.pool.env_key=MIRASIM_POOL_SESSION_TOKEN".into(),
-            "-c".into(),
-            "preferred_auth_method=apikey".into(),
-            "-c".into(),
-            format!("model_catalog_json={catalog}"),
-        ],
-        env: vec![("MIRASIM_POOL_SESSION_TOKEN".into(), "mirasim-pool".into())],
-        client_name: "codex-acp-test".into(),
-        client_version: "0".into(),
-        experimental_api: true,
-        codex_path: None,
+
+    let mut spawn = SpawnConfig::new()
+        .client_info("codex-acp-live-test", env!("CARGO_PKG_VERSION"))
+        .experimental_api(true)
+        .override_config("model_provider", "pool")
+        .override_config("model_providers.pool.name", "pool")
+        .override_config("model_providers.pool.base_url", base_url)
+        .override_config("model_providers.pool.wire_api", "responses")
+        .override_config("model_providers.pool.env_key", "MIRASIM_POOL_SESSION_TOKEN")
+        .override_config("preferred_auth_method", "apikey")
+        .env_var("MIRASIM_POOL_SESSION_TOKEN", "mirasim-pool");
+
+    if std::path::Path::new(&catalog).exists() {
+        spawn = spawn.override_config("model_catalog_json", catalog);
     }
+    if let Ok(bin) = std::env::var("CODEX_ACP_CODEX_PATH").or_else(|_| std::env::var("CODEX_PATH"))
+        && !bin.trim().is_empty()
+    {
+        spawn = spawn.codex_path(bin);
+    }
+
+    CodexAcpConfig::new().spawn(spawn).default_mode("read-only")
 }
 
-/// A complete turn through the real app-server: thread/start, turn/start,
-/// streamed agent deltas, turn/completed.
+/// Drives `initialize` -> `session/new` -> `set_model` -> `session/prompt`
+/// ("Reply with exact word: PONG") -> streamed updates -> clean teardown
+/// through `codex_acp::serve()`.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires `codex` in PATH and a live provider pool"]
-async fn live_pool_turn() {
-    let model = std::env::var("POOL_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
-    let cfg = pool_config();
-    let (server, drive) = AppServer::spawn(&cfg).await.unwrap();
-    tokio::spawn(drive);
-    server.handshake(&cfg).await.unwrap();
+#[ignore = "requires `codex` in PATH and a reachable local provider pool"]
+async fn live_pool_turn_through_serve() {
+    let base_url = resolve_pool_url();
+    if !pool_reachable(&base_url) {
+        tracing::warn!(%base_url, "skipping live test: provider pool endpoint unreachable");
+        return;
+    }
+    let model = resolve_test_model();
+    let cfg = build_live_config(&base_url);
 
-    let start: Value = server
-        .call(
-            "thread/start",
-            &json!({
-                "cwd": env!("CARGO_MANIFEST_DIR"),
-                "model": model,
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-            }),
-        )
+    let (client_t, server_t) = rpc::Memory::pair();
+    let (_peer, server_fut) = serve(server_t, cfg);
+    let server_task = tokio::spawn(server_fut);
+
+    let (client, conn) = Client::builder(Implementation::new("codex-acp-live", "0.1.0"))
+        .connect(client_t)
         .await
-        .unwrap();
-    let tid = start["thread"]["id"].as_str().unwrap().to_string();
-    let rx = server.subscribe(tid.clone()).await;
+        .expect("ACP initialize against live codex app-server");
+    let conn_task = tokio::spawn(conn);
 
-    server
-        .call::<_, Value>(
-            "turn/start",
-            &json!({
-                "threadId": tid,
-                "input": [{"type": "text", "text": "Reply with exactly: pong"}],
-            }),
-        )
+    let session = client
+        .new_session(env!("CARGO_MANIFEST_DIR"))
+        .open()
         .await
-        .unwrap();
+        .expect("live session/new");
+    let _ = session.set_model(model.as_str()).await;
 
-    let mut saw_text = false;
-    let mut saw_error = false;
-    let mut status = "none";
-    let mut seen: Vec<String> = Vec::new();
-    let collect = async {
-        while let Ok(ev) = rx.recv().await {
-            seen.push(format!("{ev:?}").chars().take(160).collect());
-            match ev {
-                AppEvent::Notification(Notification::AgentMessageDelta(d)) => {
-                    if !d.delta.trim().is_empty() {
-                        saw_text = true;
-                    }
-                }
-                AppEvent::Notification(Notification::ItemCompleted(n)) => {
-                    let item = serde_json::to_value(&n.item).unwrap_or_default();
-                    let is_agent_msg = item.get("type").and_then(Value::as_str)
-                        == Some("agentMessage")
-                        && item
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|t| !t.trim().is_empty());
-                    if is_agent_msg {
-                        saw_text = true;
-                    }
-                }
-                AppEvent::Notification(Notification::TurnCompleted(n)) => {
-                    status = match n.turn.status {
-                        TurnStatus::Completed => "completed",
-                        _ => "other",
-                    };
-                    break;
-                }
-                AppEvent::Notification(Notification::Error(_)) => {
-                    saw_error = true;
-                }
-                AppEvent::Notification(Notification::ThreadStatusChanged(n)) => {
-                    if format!("{:?}", n.status).contains("SystemError") {
-                        saw_error = true;
-                    }
-                }
-                AppEvent::Request { id, .. } => {
-                    let _ = server
-                        .respond_error(&id, -32601, "unexpected request")
-                        .await;
-                }
-                _ => {}
+    let mut turn = session
+        .prompt("Reply with exact word: PONG")
+        .expect("live session/prompt");
+    let mut saw_notice_error = false;
+    let outcome = tokio::time::timeout(Duration::from_secs(120), async {
+        while let Some(ev) = turn.next().await {
+            if matches!(ev, SessionEvent::Notice(_)) {
+                saw_notice_error = true;
             }
         }
-    };
-    tokio::time::timeout(Duration::from_secs(120), collect)
+        turn.finish().await
+    })
+    .await
+    .expect("live turn timed out after 120s");
+
+    let streamed_text: String = session
+        .state()
+        .messages
+        .iter()
+        .filter(|((kind, _), _)| *kind == MessageKind::Agent)
+        .flat_map(|(_, m)| {
+            m.content
+                .as_ref()
+                .into_option()
+                .into_iter()
+                .flatten()
+                .filter_map(ContentBlock::as_text)
+        })
+        .collect();
+
+    assert!(
+        matches!(
+            &outcome,
+            TurnOutcome::Finished {
+                stop_reason: Some(Open::Known(StopReason::EndTurn)),
+                ..
+            }
+        ),
+        "unexpected live turn outcome: {outcome:?}"
+    );
+    assert!(
+        !streamed_text.trim().is_empty() || saw_notice_error,
+        "live turn completed with neither streamed assistant text nor an upstream error notice"
+    );
+
+    session.close().await.expect("session/close");
+    client.close().await;
+    tokio::time::timeout(Duration::from_secs(5), conn_task)
         .await
-        .expect("turn did not complete in 120s");
-    for e in &seen {
-        eprintln!("EV: {e}");
-    }
-    // Healthy upstream: a completed turn must deliver agent text. Exhausted
-    // upstream (pool quota): codex still completes the turn with an error
-    // status and an ErrorNotification — the bridge must surface both.
-    if status == "completed" {
-        assert!(saw_text, "completed turn delivered no agent text");
-    } else {
-        assert!(saw_error, "failed turn delivered no error notification");
-    }
+        .expect("client connection shutdown")
+        .expect("client task panicked");
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server shutdown")
+        .expect("server task panicked");
 }

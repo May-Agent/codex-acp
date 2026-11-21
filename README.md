@@ -1,83 +1,112 @@
 # codex-acp
 
-A pure-Rust library that serves the [Agent Client Protocol](https://agentclientprotocol.com)
-(v1) and bridges every operation onto `codex app-server` — Codex's own
-JSON-RPC interface — over newline-delimited JSON.
+A runtime-agnostic Rust workspace serving OpenAI Codex over the
+[Agent Client Protocol](https://agentclientprotocol.com) (ACP v1 and v2) by
+bridging `aither-acp` onto `codex app-server`:
 
-It is the piece an editor agent spawns (stdio) or embeds (in-process streams)
-to drive Codex: sessions, prompts, streaming updates, permissions, modes and
-auth, all translated to app-server thread/turn/item traffic.
+- **`codex-sdk`** (`sdk/`) — standalone client SDK for `codex app-server`
+  (LF-only NDJSON framing preserving unescaped `U+2028`/`U+2029`, JSON-RPC
+  correlation without a `jsonrpc` wire field, concurrent `ServerRequestHandler`,
+  per-`threadId` event demultiplexing, and optional child process supervision
+  behind the `process` feature).
+- **`codex-acp`** (`.`) — dual-stack ACP v1/v2 agent server (`CodexAgent`,
+  `CodexSession`, `serve`, `serve_stdio`) built onto `aither-acp` and
+  `codex-sdk`.
 
-## Status
+## Features
 
-Initial implementation. Covered today:
-
-- ndjson JSON-RPC duplex with id-correlated requests, inbound requests and
-  notifications, LF-only framing (U+2028/U+2029 preserved inside strings)
-- `codex app-server` lifecycle: spawn (feature `process`) or attach to
-  existing streams, `initialize` handshake, typed calls, per-`threadId`
-  event demultiplexing
-- ACP v1 handlers: `initialize`, `authenticate` (api-key, chat-gpt device
-  flow), `session/{new,load,resume,fork,list,close,delete}`, `session/prompt`,
-  `session/cancel`, `session/set_mode`, `session/set_config_option`,
-  `_`-extension methods (`session/set_model`, steering, logout, status)
-- session modes mapped to codex approval + sandbox policies
-  (`read-only`, `workspace-write`, `agent`, `agent-full-access`)
-- config options: `mode`, `model`, `reasoning_effort`, `fast-mode`
-- thread items and turn notifications -> `SessionUpdate` (agent text,
-  reasoning, plans, tool calls with diffs and output, usage, stop reasons)
-- approvals (`commandExecution`, `fileChange`, patch) bridged to
-  `session/request_permission`; unsupported server requests answered with a
-  refusal
-- slash commands: `/compact`, `/status`, `/logout`,
-  `/review`, `/review-branch`, `/review-commit`
-- in-memory wire tests (request correlation, demux, approval round-trip,
-  line-separator framing)
-
-Tracked follow-ups live in the issue tracker (AIR extensions, native
-subagent sessions, async tasks, session index/goals, live-pool integration
-test).
+- Dual-stack ACP v1 and v2 negotiation, capability translation, and state
+  updates via `aither-acp`
+- Authentication: `chat-gpt`, `chat-gpt-device-code`, `api-key`, custom
+  `gateway`, `auth/logout` (`logout` on v1), `_auth/status_update` push
+  notifications, and legacy `authentication/{status,logout}` RPCs
+- Session lifecycle: `session/{new,load,resume,fork,list,close,delete}`, MCP
+  server forwarding (`stdio`, `http`, `sse`), and transcript history replay
+- Modes (`read-only`, `workspace-write`, `agent`, `agent-full-access`) and
+  config options (`mode`, `model`, `reasoning_effort`, boolean `fast-mode`),
+  plus legacy `session/set_model`
+- Streaming agent text, reasoning summaries, plans, tool calls (with diffs,
+  locations, command/file output chunks, and MCP metadata), token usage, and
+  capability-gated notices
+- Mid-turn and out-of-prompt approvals (`commandExecution`, `execCommand`,
+  `fileChange`, `applyPatch`, `permissions`), `requestUserInput`, MCP form/URL
+  elicitations, `strictReviewRequired` escalation, and per-session permission
+  memory
+- Steering (`_session/steering`, legacy `_codex/session/steering`, and v2
+  concurrent prompt merging) and slash commands (`/compact`, `/status`,
+  `/logout`, `/review`, `/review-branch`, `/review-commit`)
 
 ## Usage
 
 ```toml
 [dependencies]
-codex-acp = { version = "0.1", features = ["process"] }
+codex-acp = { git = "https://github.com/May-Agent/codex-acp", branch = "main" }
 ```
+
+### Stdio adapter (`process` feature, enabled by default)
 
 ```rust,no_run
 use codex_acp::{CodexAcpConfig, serve_stdio};
 
 #[tokio::main]
-async fn main() -> Result<(), agent_client_protocol::Error> {
-    // Spawns `codex app-server`, performs the handshake and serves ACP on
-    // process stdio — the usual editor-adapter entry point.
-    serve_stdio(CodexAcpConfig::default()).await
+async fn main() {
+    let (_peer, server) = serve_stdio(CodexAcpConfig::new());
+    server.await;
 }
 ```
 
-To embed the bridge on existing streams instead of spawning a child:
+### Custom transport or in-memory streams (`default-features = false`)
 
-```rust,ignore
-let (server, drive) = AppServer::attach(read, write);
-tokio::spawn(drive);          // or `or`/`race` it against your own loop
-server.handshake(&spawn_config).await?;
-serve(my_acp_transport, server, drive, CodexAcpConfig::default()).await?;
+```rust,no_run
+use codex_acp::{CodexAcpConfig, ConnectedAppServer, serve};
+
+# async fn example(
+#     acp_transport: impl codex_acp::aither_acp::Transport + 'static,
+#     read: impl futures_lite::io::AsyncRead + Unpin + Send + 'static,
+#     write: impl futures_lite::io::AsyncWrite + Unpin + Send + 'static,
+# ) {
+let slot = std::sync::Mutex::new(Some((read, write)));
+let config = CodexAcpConfig::new()
+    .default_mode("workspace-write")
+    .connector(move |_spawn, handler| {
+        let (r, w) = slot.lock().unwrap().take().expect("connected once");
+        std::future::ready(Ok(ConnectedAppServer::attach(r, w, handler)))
+    });
+
+let (_peer, server) = serve(acp_transport, config);
+server.await;
+# }
 ```
 
-`serve` takes any `ConnectTo<Agent>` transport — `sdk::Stdio` for process
-stdio, or `sdk::Lines`/custom transports for in-memory or socket pairs.
+## Configuration & environment variables
 
-## Configuration
+- `CodexAcpConfig::codex_path` / `SpawnConfig::codex_path` — explicit `codex`
+  executable path; falls back to `CODEX_PATH` and then `"codex"` on `PATH`.
+- `SpawnConfig::override_config` / `SpawnConfig::args` — `-c key=value`
+  overrides and extra CLI arguments passed to `codex app-server`.
+- `SpawnConfig::env_var` — environment variables (`CODEX_API_KEY`,
+  `OPENAI_API_KEY`, etc.) passed to the spawned `codex` process.
+- `CodexAcpConfig::default_mode` — initial session mode (`"agent"` by default).
 
-`CodexAcpConfig { spawn: SpawnConfig, default_mode: Option<String> }`
+## Development & testing
 
-- `SpawnConfig::codex_path` / `CODEX_PATH` env — which `codex` to run
-- `SpawnConfig::args` — extra args appended to `codex app-server` (e.g.
-  `-c model_provider=...`)
-- `SpawnConfig::env` — child environment additions
-- `SpawnConfig::client_name`/`client_version` — reported at `initialize`
-- `default_mode` — mode applied when the client selects none (`agent`)
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo nextest run --workspace --all-features --no-tests=pass
+cargo nextest run --workspace --no-default-features --no-tests=pass
+cargo test --doc --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+```
+
+To run the ignored live integration test against a local `codex` binary and
+provider pool:
+
+```bash
+CODEX_ACP_POOL_URL=http://127.0.0.1:64395/v1 CODEX_ACP_TEST_MODEL=gpt-6-luna \
+    cargo nextest run -p codex-acp --test live --run-ignored only
+```
 
 ## License
 

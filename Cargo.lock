@@ -8,7 +8,6 @@ version = "0.31.0"
 source = "git+https://github.com/May-Agent/aither?branch=main#7a2cfb525b2936440b3c9c998265a3678187d5a6"
 dependencies = [
  "async-channel",
- "async-process",
  "blocking",
  "futures-lite",
  "futures-util",
@@ -152,7 +151,6 @@ dependencies = [
  "aither-acp",
  "async-channel",
  "async-lock",
- "async-process",
  "codex-codes",
  "codex-sdk",
  "futures-lite",
