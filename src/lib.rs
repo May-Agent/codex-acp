@@ -59,7 +59,7 @@ pub use agent::CodexAgent;
 pub use config::ProcessAppServerConnector;
 pub use config::{AnyAppServerConnector, AppServerConnector, CodexAcpConfig, ConnectedAppServer};
 pub use error::{CodexAcpError, Result};
-pub use mode::AcpMode;
+pub use mode::{AcpMode, CollaborationMode};
 pub use session::CodexSession;
 
 /// Serve a [`CodexAgent`] configured with `config` over an arbitrary
@@ -74,13 +74,17 @@ where
     T: aither_acp::Transport + 'static,
 {
     let agent = CodexAgent::new(config);
-    let bg_agent = agent.clone();
+    let bg_pump = agent.drive_background();
     let shutdown_agent = agent.clone();
     let server = agent.clone().into_server();
     let (peer, connection) = server.serve(transport);
     agent.set_peer(peer.clone());
     let wrapped = async move {
-        futures_lite::future::or(connection, bg_agent.drive_background()).await;
+        futures_lite::future::or(connection, async move {
+            bg_pump.await;
+            std::future::pending::<()>().await;
+        })
+        .await;
         shutdown_agent.shutdown_all().await;
     };
     (peer, wrapped)

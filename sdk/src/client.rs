@@ -13,14 +13,16 @@ use std::task::Poll;
 
 use async_channel::{Receiver, Sender};
 use codex_codes::{
-    GetAccountParams, GetAccountResponse, InitializeParams, InitializeResponse, LoginAccountParams,
-    LoginAccountResponse, LogoutAccountResponse, ModelListParams, ModelListResponse, Notification,
-    RequestId, ReviewStartParams, ReviewStartResponse, ServerRequest, ThreadCompactStartParams,
-    ThreadCompactStartResponse, ThreadDeleteParams, ThreadDeleteResponse, ThreadForkParams,
-    ThreadForkResponse, ThreadListParams, ThreadListResponse, ThreadReadParams, ThreadReadResponse,
-    ThreadResumeParams, ThreadResumeResponse, ThreadStartParams, ThreadStartResponse,
-    ThreadUnsubscribeParams, ThreadUnsubscribeResponse, TurnInterruptParams, TurnInterruptResponse,
-    TurnStartParams, TurnStartResponse, TurnSteerParams, TurnSteerResponse, protocol::methods,
+    GetAccountParams, GetAccountRateLimitsParams, GetAccountRateLimitsResponse, GetAccountResponse,
+    InitializeParams, InitializeResponse, ListMcpServerStatusParams, ListMcpServerStatusResponse,
+    LoginAccountParams, LoginAccountResponse, LogoutAccountResponse, ModelListParams,
+    ModelListResponse, Notification, RequestId, ReviewStartParams, ReviewStartResponse,
+    ServerRequest, ThreadCompactStartParams, ThreadCompactStartResponse, ThreadDeleteParams,
+    ThreadDeleteResponse, ThreadForkParams, ThreadForkResponse, ThreadListParams,
+    ThreadListResponse, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
+    ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, ThreadUnsubscribeParams,
+    ThreadUnsubscribeResponse, TurnInterruptParams, TurnInterruptResponse, TurnStartParams,
+    TurnStartResponse, TurnSteerParams, TurnSteerResponse, protocol::methods,
 };
 use futures_lite::future::{or, zip};
 #[cfg(feature = "process")]
@@ -880,6 +882,30 @@ impl AppServer {
     /// Propagates RPC or decode errors from [`Self::call`].
     pub async fn account_read(&self, params: &GetAccountParams) -> Result<GetAccountResponse> {
         self.call(methods::ACCOUNT_READ, params).await
+    }
+
+    /// Read current account rate-limit windows (`account/rateLimits/read`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates RPC or decode errors from [`Self::call`].
+    pub async fn account_rate_limits_read(
+        &self,
+        params: &GetAccountRateLimitsParams,
+    ) -> Result<GetAccountRateLimitsResponse> {
+        self.call(methods::ACCOUNT_RATELIMITS_READ, params).await
+    }
+
+    /// List configured MCP server statuses (`mcpServerStatus/list`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates RPC or decode errors from [`Self::call`].
+    pub async fn mcp_server_status_list(
+        &self,
+        params: &ListMcpServerStatusParams,
+    ) -> Result<ListMcpServerStatusResponse> {
+        self.call(methods::MCPSERVERSTATUS_LIST, params).await
     }
 
     async fn upgrade_transport_error(&self, err: SdkError) -> SdkError {
