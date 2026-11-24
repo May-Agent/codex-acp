@@ -8,24 +8,26 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use codex_acp::agent::{COMPACT_METHOD, MCP_STATUS_METHOD, RATE_LIMITS_METHOD};
 use codex_acp::aither_acp::client::{
-    Client, ElicitationHandler, MessageKind, NotificationHandler, PermissionHandler, SessionEvent,
-    TurnOutcome,
+    Client, ClientError, ElicitationHandler, MessageKind, NotificationHandler, PermissionHandler,
+    SessionEvent, TurnOutcome,
 };
 use codex_acp::aither_acp::domain::{
-    AcceptAction, AudioContent, ConfigValue, ConfigValueBoolean, ConfigValueById, ConfigValueId,
-    ContentBlock, ElicitAction, ElicitComplete, ElicitContentValue, ElicitCreate, ElicitMode,
-    ElicitResult, EmbeddedResource, ExtMethod, HttpHeader, ImageContent, Implementation, McpServer,
-    McpServerHttp, McpServerStdio, NoticeSeverity, Open, PermissionOptionId, PermissionOutcome,
-    PermissionRequest, ResourceContents, ResourceLink, SelectedOutcome, StopReason,
-    TextResourceContents,
+    AcceptAction, AudioContent, ConfigKind, ConfigValue, ConfigValueBoolean, ConfigValueById,
+    ConfigValueId, ContentBlock, ElicitAction, ElicitComplete, ElicitContentValue, ElicitCreate,
+    ElicitMode, ElicitResult, EmbeddedResource, ExtMethod, HttpHeader, ImageContent,
+    Implementation, McpServer, McpServerHttp, McpServerStdio, NoticeSeverity, Open,
+    PermissionOptionId, PermissionOutcome, PermissionRequest, ResourceContents, ResourceLink,
+    SelectOptions, SelectedOutcome, StopReason, TextResourceContents,
 };
 use codex_acp::aither_acp::ext::steering::METHOD as STEERING_METHOD;
 use codex_acp::aither_acp::rpc::{
     self, Handler, Notification as RpcNotification, Peer, Request as RpcRequest, RequestContext,
     Response as RpcResponse,
 };
-use codex_acp::{CodexAcpConfig, ConnectedAppServer, serve};
+use codex_acp::mode::COLLABORATION_MODE_CONFIG_ID;
+use codex_acp::{CodexAcpConfig, CodexAgent, ConnectedAppServer, serve};
 use futures_lite::Stream as _;
 use futures_lite::StreamExt as _;
 use futures_lite::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -331,9 +333,94 @@ async fn run_mock_loop(
             "account/logout"
             | "thread/unsubscribe"
             | "thread/delete"
-            | "thread/compact/start"
             | "modelProvider/default/set" => {
                 let _ = outbound_tx.send(json!({"id": req_id, "result": {}})).await;
+            }
+            "thread/compact/start" => {
+                let tid = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+                if tid == "fail-thread" {
+                    let _ = outbound_tx
+                        .send(json!({
+                            "id": req_id,
+                            "error": {"code": -32001, "message": "cannot compact unknown thread"}
+                        }))
+                        .await;
+                } else {
+                    let _ = outbound_tx.send(json!({"id": req_id, "result": {}})).await;
+                }
+            }
+            "mcpServerStatus/list" => {
+                let tid = params.get("threadId").and_then(Value::as_str);
+                let cursor = params.get("cursor").and_then(Value::as_str);
+                if tid == Some("fail-thread") {
+                    let _ = outbound_tx
+                        .send(json!({
+                            "id": req_id,
+                            "error": {"code": -32002, "message": "mcp status unavailable"}
+                        }))
+                        .await;
+                } else if cursor == Some("page-2") {
+                    let _ = outbound_tx
+                        .send(json!({
+                            "id": req_id,
+                            "result": {
+                                "data": [{
+                                    "name": "remote-docs",
+                                    "runtimeStatus": "connected",
+                                    "authStatus": "unsupported",
+                                    "tools": {"lookup": {"name": "lookup"}}
+                                }],
+                                "nextCursor": null
+                            }
+                        }))
+                        .await;
+                } else {
+                    let next_cursor = params
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .and_then(|limit| (limit == 1).then_some("page-2"));
+                    let _ = outbound_tx
+                        .send(json!({
+                            "id": req_id,
+                            "result": {
+                                "data": [{
+                                    "name": "flyco",
+                                    "runtimeStatus": "connected",
+                                    "authStatus": "unsupported",
+                                    "tools": {"flyco_status": {"name": "flyco_status"}}
+                                }],
+                                "nextCursor": next_cursor
+                            }
+                        }))
+                        .await;
+                }
+            }
+            "account/rateLimits/read" => {
+                let exclude = params
+                    .get("excludeResetCreditDetails")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let _ = outbound_tx
+                    .send(json!({
+                        "id": req_id,
+                        "result": {
+                            "accountId": "acct-1",
+                            "ordinaryUsageAllowed": true,
+                            "rateLimits": {
+                                "primary": {
+                                    "usedPercent": 42,
+                                    "windowDurationMins": 300,
+                                    "resetsAt": 1_787_100_000_i64
+                                },
+                                "secondary": {
+                                    "usedPercent": 12,
+                                    "windowDurationMins": 10080
+                                }
+                            },
+                            "excludeResetCreditDetailsEcho": exclude
+                        }
+                    }))
+                    .await;
             }
             "modelProvider/config/write" => {
                 let _ = outbound_tx
@@ -1679,4 +1766,416 @@ async fn v1_gateway_legacy_methods_and_capability_gated_notices() {
         "v1 client advertising notices capability must receive notice updates: {cap_updates:?}"
     );
     cap_peer.close();
+}
+
+// --- Test 5: `_codex/mcp_status`, `_codex/rate_limits`, and `_codex/compact` extensions
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn codex_extension_methods_mcp_status_rate_limits_and_compact() {
+    let (cfg, ctrl) = spawn_mock_app_server();
+    let (client_t, server_t) = rpc::Memory::pair();
+    let (_server_peer, server_fut) = serve(server_t, cfg);
+    let server_task = tokio::spawn(server_fut);
+
+    let (client, conn) = Client::builder(Implementation::new("ext-client", "1.0"))
+        .connect(client_t)
+        .await
+        .expect("connect");
+    let conn_task = tokio::spawn(conn);
+
+    let session = client
+        .new_session("/workspace")
+        .open()
+        .await
+        .expect("new_session");
+
+    // 1. `_codex/mcp_status`: empty params, `sessionId` resolution, `threadId` alias, pagination, and error paths
+    let mcp_method = ExtMethod::new(MCP_STATUS_METHOD);
+    let mcp_default = client
+        .ext_request(&mcp_method, &json!({}))
+        .await
+        .expect("_codex/mcp_status empty params");
+    assert_eq!(mcp_default["data"][0]["name"], "flyco");
+    assert_eq!(mcp_default["data"][0]["runtimeStatus"], "connected");
+
+    let mcp_by_session = client
+        .ext_request(
+            &mcp_method,
+            &json!({"sessionId": session.id().as_str(), "limit": 1}),
+        )
+        .await
+        .expect("_codex/mcp_status by sessionId");
+    assert_eq!(mcp_by_session["nextCursor"], "page-2");
+
+    let mcp_page2 = client
+        .ext_request(
+            &mcp_method,
+            &json!({"threadId": session.id().as_str(), "cursor": "page-2", "detail": "full"}),
+        )
+        .await
+        .expect("_codex/mcp_status page 2");
+    assert_eq!(mcp_page2["data"][0]["name"], "remote-docs");
+
+    let mcp_calls = ctrl.calls_for("mcpServerStatus/list");
+    assert_eq!(mcp_calls.len(), 3);
+    assert_eq!(mcp_calls[0], json!({}));
+    assert_eq!(mcp_calls[1]["threadId"], "thread-1");
+    assert_eq!(mcp_calls[1]["limit"], 1);
+    assert!(mcp_calls[1].get("sessionId").is_none());
+    assert_eq!(mcp_calls[2]["threadId"], "thread-1");
+    assert_eq!(mcp_calls[2]["cursor"], "page-2");
+    assert_eq!(mcp_calls[2]["detail"], "full");
+
+    // `_codex/mcp_status` error paths
+    assert!(matches!(
+        client
+            .ext_request(&mcp_method, &json!({"sessionId": "missing-session"}))
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32602
+    ));
+    assert!(matches!(
+        client
+            .ext_request(&mcp_method, &json!({"limit": -5}))
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32602
+    ));
+    assert!(matches!(
+        client
+            .ext_request(&mcp_method, &json!({"cursor": 123}))
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32602
+    ));
+    assert!(matches!(
+        client
+            .ext_request(&mcp_method, &json!(["not-an-object"]))
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32602
+    ));
+    assert!(matches!(
+        client
+            .ext_request(&mcp_method, &json!({"threadId": "fail-thread"}))
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32002
+    ));
+
+    // 2. `_codex/rate_limits`: default params, optional flags, and error paths
+    let rate_method = ExtMethod::new(RATE_LIMITS_METHOD);
+    let rates = client
+        .ext_request(&rate_method, &json!({}))
+        .await
+        .expect("_codex/rate_limits");
+    assert_eq!(rates["rateLimits"]["primary"]["usedPercent"], 42);
+    assert_eq!(rates["rateLimits"]["primary"]["windowDurationMins"], 300);
+    assert_eq!(rates["rateLimits"]["secondary"]["usedPercent"], 12);
+
+    let rates_compact = client
+        .ext_request(&rate_method, &json!({"excludeResetCreditDetails": true}))
+        .await
+        .expect("_codex/rate_limits with flag");
+    assert_eq!(rates_compact["excludeResetCreditDetailsEcho"], true);
+
+    let rate_calls = ctrl.calls_for("account/rateLimits/read");
+    assert_eq!(rate_calls.len(), 2);
+    assert_eq!(rate_calls[0], json!({}));
+    assert_eq!(rate_calls[1], json!({"excludeResetCreditDetails": true}));
+
+    assert!(matches!(
+        client
+            .ext_request(&rate_method, &json!({"excludeResetCreditDetails": "yes"}))
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32602
+    ));
+    assert!(matches!(
+        client.ext_request(&rate_method, &json!("bad")).await,
+        Err(ClientError::Rejected(err)) if err.code == -32602
+    ));
+
+    // 3. `_codex/compact`: via `sessionId`, via direct `threadId`, via ACP session id in `threadId`, `/compact` still working, and error paths
+    let compact_method = ExtMethod::new(COMPACT_METHOD);
+    let _ = client
+        .ext_request(
+            &compact_method,
+            &json!({"sessionId": session.id().as_str()}),
+        )
+        .await
+        .expect("_codex/compact by sessionId");
+    let _ = client
+        .ext_request(&compact_method, &json!({"threadId": "thread-1"}))
+        .await
+        .expect("_codex/compact by threadId");
+    let _ = client
+        .ext_request(&compact_method, &json!({"threadId": session.id().as_str()}))
+        .await
+        .expect("_codex/compact with ACP sessionId in threadId");
+    assert_end_turn(&session.prompt_run("/compact").await.expect("/compact"));
+
+    let compact_calls = ctrl.calls_for("thread/compact/start");
+    assert_eq!(compact_calls.len(), 4);
+    for call in &compact_calls {
+        assert_eq!(call["threadId"], "thread-1");
+    }
+
+    assert!(matches!(
+        client.ext_request(&compact_method, &json!({})).await,
+        Err(ClientError::Rejected(err)) if err.code == -32602
+    ));
+    assert!(matches!(
+        client
+            .ext_request(&compact_method, &json!({"sessionId": "does-not-exist"}))
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32602
+    ));
+    assert!(matches!(
+        client
+            .ext_request(&compact_method, &json!({"threadId": ""}))
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32602
+    ));
+    assert!(matches!(
+        client
+            .ext_request(&compact_method, &json!({"threadId": "fail-thread"}))
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32001
+    ));
+
+    // Unknown `_codex/*` extension returns -32601
+    assert!(matches!(
+        client
+            .ext_request(&ExtMethod::new("_codex/nonexistent"), &json!({}))
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32601
+    ));
+
+    client.close().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), conn_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+}
+
+// --- Test 6: `collaboration_mode` config option (`default` / `plan`) and turn propagation
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn collaboration_mode_config_option_and_turn_propagation() {
+    let (cfg, ctrl) = spawn_mock_app_server();
+    let (client_t, server_t) = rpc::Memory::pair();
+    let (_server_peer, server_fut) = serve(server_t, cfg);
+    let server_task = tokio::spawn(server_fut);
+
+    let perms = RecordingPermissions::new("allow_always");
+    let (client, conn) = Client::builder(Implementation::new("collab-client", "1.0"))
+        .permissions(perms)
+        .connect(client_t)
+        .await
+        .expect("connect");
+    let conn_task = tokio::spawn(conn);
+
+    let session = client
+        .new_session("/workspace")
+        .open()
+        .await
+        .expect("new_session");
+
+    // Advertised in initial config_options with default = "default" and values ["default", "plan"]
+    let initial_opts = session.state().config_options;
+    let collab_opt = initial_opts
+        .iter()
+        .find(|o| o.config_id.as_str() == COLLABORATION_MODE_CONFIG_ID)
+        .expect("collaboration_mode must be advertised in config_options");
+    let ConfigKind::Select(select) = &collab_opt.kind else {
+        panic!("expected select kind for collaboration_mode");
+    };
+    assert_eq!(select.current_value.as_str(), "default");
+    let SelectOptions::Ungrouped(entries) = &select.options else {
+        panic!("expected ungrouped options");
+    };
+    let values: Vec<&str> = entries.iter().map(|e| e.value.as_str()).collect();
+    assert_eq!(values, vec!["default", "plan"]);
+
+    // Turn 1 (never changed from default): `collaborationMode` is omitted
+    assert_end_turn(&session.prompt_run("default turn").await.unwrap());
+    let starts = ctrl.calls_for("turn/start");
+    assert_eq!(starts.len(), 1);
+    assert!(starts[0].get("collaborationMode").is_none());
+
+    // Enter Plan mode alongside `read-only` session mode
+    session.set_mode("read-only").await.expect("set read-only");
+    session
+        .set_config(
+            COLLABORATION_MODE_CONFIG_ID,
+            ConfigValue::Id(ConfigValueById {
+                value: ConfigValueId::from_string("plan"),
+            }),
+        )
+        .await
+        .expect("set collaboration_mode = plan");
+
+    // Reject unknown collaboration_mode values cleanly
+    assert!(matches!(
+        session
+            .set_config(
+                COLLABORATION_MODE_CONFIG_ID,
+                ConfigValue::Id(ConfigValueById {
+                    value: ConfigValueId::from_string("bogus"),
+                }),
+            )
+            .await,
+        Err(ClientError::Rejected(err)) if err.code == -32602
+    ));
+
+    // `/status` reflects the active collaboration mode
+    assert_end_turn(&session.prompt_run("/status").await.unwrap());
+    let status_text: String = session
+        .state()
+        .messages
+        .iter()
+        .filter(|((kind, _), _)| *kind == MessageKind::Agent)
+        .flat_map(|(_, m)| {
+            m.content
+                .as_ref()
+                .into_option()
+                .into_iter()
+                .flatten()
+                .filter_map(ContentBlock::as_text)
+        })
+        .collect();
+    assert!(
+        status_text.contains("Collaboration mode: plan"),
+        "expected Collaboration mode: plan in {status_text}"
+    );
+
+    // Turn 2 (Plan mode active): `turn/start` includes `collaborationMode` alongside `sandboxPolicy`
+    assert_end_turn(&session.prompt_run("plan turn").await.unwrap());
+    let starts = ctrl.calls_for("turn/start");
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1]["sandboxPolicy"]["type"], "readOnly");
+    assert_eq!(starts[1]["approvalPolicy"], "on-request");
+    assert_eq!(starts[1]["collaborationMode"]["mode"], "plan");
+    assert_eq!(
+        starts[1]["collaborationMode"]["settings"]["model"],
+        "gpt-5.4"
+    );
+    assert_eq!(
+        starts[1]["collaborationMode"]["settings"]["reasoning_effort"],
+        "medium"
+    );
+    assert_eq!(
+        starts[1]["collaborationMode"]["settings"]["developer_instructions"],
+        Value::Null
+    );
+
+    // Switch back to `default`: Turn 3 explicitly sends `mode: "default"` so Codex exits Plan mode
+    session
+        .set_config(
+            COLLABORATION_MODE_CONFIG_ID,
+            ConfigValue::Id(ConfigValueById {
+                value: ConfigValueId::from_string("default"),
+            }),
+        )
+        .await
+        .expect("set collaboration_mode = default");
+    assert_end_turn(&session.prompt_run("back to default").await.unwrap());
+    let starts = ctrl.calls_for("turn/start");
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[2]["collaborationMode"]["mode"], "default");
+
+    client.close().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), conn_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+}
+
+// --- Test 7: In-process hosting with `CodexAgent::drive_background`
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_process_hosting_pumps_background_server_requests_and_shuts_down_cleanly() {
+    let (cfg, ctrl) = spawn_mock_app_server();
+    let agent = CodexAgent::new(cfg);
+    let bg_task = tokio::spawn(agent.drive_background());
+
+    let perms = RecordingPermissions::new("allow_once");
+    let elicits = RecordingElicitations::default();
+
+    let (client, conn) = Client::builder(Implementation::new("in-process-host", "1.0"))
+        .permissions(perms.clone())
+        .elicitation(elicits.clone())
+        .in_process(agent)
+        .await
+        .expect("in_process connect");
+    let conn_task = tokio::spawn(conn);
+
+    let session = client
+        .new_session("/workspace")
+        .open()
+        .await
+        .expect("in-process new_session");
+
+    // While idle between prompts, server-initiated approval and elicitation requests MUST progress!
+    ctrl.send_raw(json!({
+        "id": "inproc-file-1",
+        "method": "item/fileChange/requestApproval",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "bg-turn",
+            "itemId": "fc-inproc",
+            "reason": "Update README.md",
+            "grantRoot": "/workspace"
+        }
+    }))
+    .await;
+    assert_eq!(
+        ctrl.wait_for_response(&json!("inproc-file-1"))
+            .await
+            .unwrap()["decision"],
+        "accept"
+    );
+
+    ctrl.send_raw(json!({
+        "id": "inproc-elicit-1",
+        "method": "mcpServer/elicitation/request",
+        "params": {
+            "_meta": {"threadId": "thread-1"},
+            "mode": "form",
+            "message": "Confirm deployment target",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {"q1": {"type": "string"}},
+                "required": ["q1"]
+            }
+        }
+    }))
+    .await;
+    let elicit_resp = ctrl
+        .wait_for_response(&json!("inproc-elicit-1"))
+        .await
+        .unwrap();
+    assert_eq!(elicit_resp["action"], "accept");
+    assert_eq!(elicit_resp["content"]["q1"], "chosen-answer");
+
+    // Prompt turns and config updates work over the direct in-process lane too
+    session
+        .set_config(
+            COLLABORATION_MODE_CONFIG_ID,
+            ConfigValue::Id(ConfigValueById {
+                value: ConfigValueId::from_string("plan"),
+            }),
+        )
+        .await
+        .expect("in-process set collaboration_mode");
+    assert_end_turn(&session.prompt_run("hello in-process").await.unwrap());
+    let starts = ctrl.calls_for("turn/start");
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["collaborationMode"]["mode"], "plan");
+
+    // Closing the in-process client must shut down BOTH the connection and `drive_background()`!
+    client.close().await;
+    drop(client);
+    drop(session);
+    tokio::time::timeout(Duration::from_secs(2), conn_task)
+        .await
+        .expect("in-process connection task must terminate")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), bg_task)
+        .await
+        .expect("drive_background task must terminate cleanly on shutdown")
+        .unwrap();
 }

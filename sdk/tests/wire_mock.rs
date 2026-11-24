@@ -10,13 +10,13 @@ use async_channel::{Receiver, Sender};
 use codex_sdk::{
     AnyServerRequestHandler, AppServer, CommandExecutionRequestApprovalParams,
     CommandExecutionRequestApprovalResponse, Connection, FileChangeRequestApprovalParams,
-    FileChangeRequestApprovalResponse, GetAccountParams, HandlerResult, Incoming,
-    LoginAccountParams, LoginAccountResponse, METHOD_NOT_FOUND_CODE, ModelListParams, NdjsonReader,
-    NdjsonWriter, NoopServerRequestHandler, Notification, RemoteError, ReviewStartParams,
-    ReviewTarget, SdkError, ServerRequestHandler, SpawnConfig, ThreadCompactStartParams,
-    ThreadDeleteParams, ThreadEvent, ThreadForkParams, ThreadListParams, ThreadReadParams,
-    ThreadResumeParams, ThreadStartParams, ThreadUnsubscribeParams, TurnInterruptParams,
-    TurnStartParams, TurnSteerParams, UserInput,
+    FileChangeRequestApprovalResponse, GetAccountParams, GetAccountRateLimitsParams, HandlerResult,
+    Incoming, ListMcpServerStatusParams, LoginAccountParams, LoginAccountResponse,
+    METHOD_NOT_FOUND_CODE, ModelListParams, NdjsonReader, NdjsonWriter, NoopServerRequestHandler,
+    Notification, RemoteError, ReviewStartParams, ReviewTarget, SdkError, ServerRequestHandler,
+    SpawnConfig, ThreadCompactStartParams, ThreadDeleteParams, ThreadEvent, ThreadForkParams,
+    ThreadListParams, ThreadReadParams, ThreadResumeParams, ThreadStartParams,
+    ThreadUnsubscribeParams, TurnInterruptParams, TurnStartParams, TurnSteerParams, UserInput,
 };
 use futures_lite::io::{AsyncRead, AsyncWrite};
 use futures_lite::stream::Stream;
@@ -114,6 +114,82 @@ impl AsyncWrite for PipeWrite {
         self.tx.close();
         Poll::Ready(Ok(()))
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_mcp_status_and_rate_limits_helpers() {
+    let ((client_r, client_w), (server_r, server_w)) = duplex_pipes();
+    let (server, drive) = AppServer::attach(client_r, client_w, NoopServerRequestHandler);
+    let drive_task = tokio::spawn(drive);
+
+    let mock_server = tokio::spawn(async move {
+        let mut reader = NdjsonReader::new(server_r);
+        let mut writer = NdjsonWriter::new(server_w);
+
+        let line1 = reader.next_line().await.unwrap().unwrap();
+        let req1: Value = serde_json::from_str(&line1).unwrap();
+        assert_eq!(req1["method"], "mcpServerStatus/list");
+        assert_eq!(req1["params"]["threadId"], "thread-9");
+        assert_eq!(req1["params"]["limit"], 5);
+        writer
+            .send_json(&json!({
+                "id": req1["id"],
+                "result": {
+                    "data": [{
+                        "name": "flyco",
+                        "authStatus": "unsupported",
+                        "tools": {},
+                        "resources": [],
+                        "resourceTemplates": []
+                    }],
+                    "nextCursor": "c-next"
+                }
+            }))
+            .await
+            .unwrap();
+
+        let line2 = reader.next_line().await.unwrap().unwrap();
+        let req2: Value = serde_json::from_str(&line2).unwrap();
+        assert_eq!(req2["method"], "account/rateLimits/read");
+        assert_eq!(req2["params"], json!({}));
+        writer
+            .send_json(&json!({
+                "id": req2["id"],
+                "result": {
+                    "accountId": "acct-42",
+                    "ordinaryUsageAllowed": true,
+                    "rateLimits": {
+                        "primary": {"usedPercent": 50, "windowDurationMins": 300}
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+    });
+
+    let mcp = server
+        .mcp_server_status_list(&ListMcpServerStatusParams {
+            thread_id: Some("thread-9".to_string()),
+            limit: Some(5),
+            ..ListMcpServerStatusParams::default()
+        })
+        .await
+        .expect("mcp_server_status_list");
+    assert_eq!(mcp.data.len(), 1);
+    assert_eq!(mcp.data[0].name, "flyco");
+    assert_eq!(mcp.next_cursor.as_deref(), Some("c-next"));
+
+    let rates = server
+        .account_rate_limits_read(&GetAccountRateLimitsParams::default())
+        .await
+        .expect("account_rate_limits_read");
+    assert_eq!(rates.account_id.as_deref(), Some("acct-42"));
+    assert_eq!(rates.ordinary_usage_allowed, Some(true));
+    assert_eq!(rates.rate_limits["primary"]["usedPercent"], 50);
+
+    server.close();
+    mock_server.await.unwrap();
+    drive_task.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

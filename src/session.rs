@@ -30,8 +30,9 @@ use crate::convert::{
 use crate::driver::DriverSlot;
 use crate::error::{CodexAcpError, Result};
 use crate::mode::{
-    AcpMode, DEFAULT_REASONING_EFFORT, EFFORT_CONFIG_ID, FAST_MODE_CONFIG_ID, MODE_CONFIG_ID,
-    MODEL_CONFIG_ID, build_available_commands, build_config_options, validate_reasoning_effort,
+    AcpMode, COLLABORATION_MODE_CONFIG_ID, CollaborationMode, DEFAULT_REASONING_EFFORT,
+    EFFORT_CONFIG_ID, FAST_MODE_CONFIG_ID, MODE_CONFIG_ID, MODEL_CONFIG_ID,
+    build_available_commands, build_config_options, validate_reasoning_effort,
 };
 use crate::permission::{
     PermissionMemory, PermissionResolution, SessionRegistry, prompt_session_permission,
@@ -53,6 +54,8 @@ struct SessionInner {
     model: Mutex<Option<String>>,
     effort: Mutex<Option<String>>,
     fast_mode: AtomicBool,
+    collaboration_mode: Mutex<CollaborationMode>,
+    collaboration_mode_explicit: AtomicBool,
     available_models: Mutex<Vec<SessionModel>>,
     active_turn: Mutex<Option<String>>,
     permission_memory: Arc<PermissionMemory>,
@@ -91,8 +94,11 @@ impl CodexSession {
         initial_mode: AcpMode,
         initial_model: Option<String>,
         initial_effort: Option<String>,
+        initial_collaboration_mode: Option<CollaborationMode>,
         available_models: Vec<SessionModel>,
     ) -> Self {
+        let collab = initial_collaboration_mode.unwrap_or_default();
+        let collab_explicit = collab != CollaborationMode::Default;
         Self {
             inner: Arc::new(SessionInner {
                 id,
@@ -110,6 +116,8 @@ impl CodexSession {
                 model: Mutex::new(initial_model.filter(|s| !s.trim().is_empty())),
                 effort: Mutex::new(initial_effort.filter(|s| !s.trim().is_empty())),
                 fast_mode: AtomicBool::new(false),
+                collaboration_mode: Mutex::new(collab),
+                collaboration_mode_explicit: AtomicBool::new(collab_explicit),
                 available_models: Mutex::new(available_models),
                 active_turn: Mutex::new(None),
                 permission_memory: Arc::new(PermissionMemory::new()),
@@ -185,6 +193,16 @@ impl CodexSession {
         self.inner.fast_mode.load(Ordering::Acquire)
     }
 
+    /// Currently selected [`CollaborationMode`] of this session.
+    #[must_use]
+    pub fn current_collaboration_mode(&self) -> CollaborationMode {
+        *self
+            .inner
+            .collaboration_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Currently active app-server `turnId`, when a turn is in flight.
     #[must_use]
     pub fn active_turn_id(&self) -> Option<String> {
@@ -248,6 +266,18 @@ impl CodexSession {
             FAST_MODE_CONFIG_ID => {
                 let enabled = config_bool_value(value)?;
                 self.inner.fast_mode.store(enabled, Ordering::Release);
+            }
+            COLLABORATION_MODE_CONFIG_ID => {
+                let raw = config_string_value(value)?;
+                let parsed = CollaborationMode::parse(&raw)?;
+                *self
+                    .inner
+                    .collaboration_mode
+                    .lock()
+                    .expect("session collaboration_mode mutex poisoned") = parsed;
+                self.inner
+                    .collaboration_mode_explicit
+                    .store(true, Ordering::Release);
             }
             other => {
                 return Err(CodexAcpError::InvalidParams(format!(
@@ -382,6 +412,7 @@ impl Session for CodexSession {
             &models,
             self.current_effort().as_deref(),
             self.fast_mode(),
+            self.current_collaboration_mode(),
         )
     }
 
@@ -441,9 +472,15 @@ impl Session for CodexSession {
         let model = self.current_model();
         let effort = self.current_effort();
         let fast = self.fast_mode();
+        let collab = self.current_collaboration_mode();
+        let send_collab = collab == CollaborationMode::Plan
+            || self
+                .inner
+                .collaboration_mode_explicit
+                .load(Ordering::Acquire);
         let roots = self.writable_roots();
 
-        let start_params = json!({
+        let mut start_params = json!({
             "threadId": self.inner.thread_id,
             "input": input,
             "cwd": self.inner.cwd.to_string_lossy(),
@@ -454,6 +491,20 @@ impl Session for CodexSession {
             "approvalsReviewer": mode.approvals_reviewer_str(),
             "sandboxPolicy": mode.sandbox_policy_json(&roots),
         });
+        if send_collab && let Some(obj) = start_params.as_object_mut() {
+            let effective_model = model.or_else(|| {
+                self.inner
+                    .available_models
+                    .lock()
+                    .expect("available_models mutex poisoned")
+                    .first()
+                    .map(|m| m.model_id.clone())
+            });
+            obj.insert(
+                "collaborationMode".to_string(),
+                collab.turn_param_json(effective_model.as_deref(), effort.as_deref()),
+            );
+        }
 
         let resp: Value = self
             .inner
@@ -1032,6 +1083,7 @@ impl CodexSession {
             .current_effort()
             .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string());
         let fast = self.fast_mode();
+        let collab = self.current_collaboration_mode();
         let auth_status = self
             .inner
             .auth
@@ -1053,10 +1105,11 @@ impl CodexSession {
             self.inner.mcp_server_names.join(", ")
         };
         format!(
-            "Session: {}\nDirectory: {}\nMode: {}\nModel: {}\nReasoning effort: {}\nFast mode: {}\nAccount: {}\nMCP servers: {}",
+            "Session: {}\nDirectory: {}\nMode: {}\nCollaboration mode: {}\nModel: {}\nReasoning effort: {}\nFast mode: {}\nAccount: {}\nMCP servers: {}",
             self.inner.id,
             self.inner.cwd.display(),
             mode.as_str(),
+            collab.as_str(),
             model,
             effort,
             fast,

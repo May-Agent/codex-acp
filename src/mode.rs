@@ -1,5 +1,6 @@
 //! ACP session modes, configuration options (`mode`, `model`,
-//! `reasoning_effort`, `fast-mode`), and advertised slash commands.
+//! `reasoning_effort`, `fast-mode`, `collaboration_mode`), and advertised slash
+//! commands.
 
 use std::collections::BTreeMap;
 
@@ -21,6 +22,8 @@ pub const MODEL_CONFIG_ID: &str = "model";
 pub const EFFORT_CONFIG_ID: &str = "reasoning_effort";
 /// Config option ID for the boolean fast-mode toggle.
 pub const FAST_MODE_CONFIG_ID: &str = "fast-mode";
+/// Config option ID for the Codex collaboration mode (`default` or `plan`).
+pub const COLLABORATION_MODE_CONFIG_ID: &str = "collaboration_mode";
 
 /// Default reasoning effort displayed when none has been configured yet.
 pub const DEFAULT_REASONING_EFFORT: &str = "medium";
@@ -167,6 +170,84 @@ impl AcpMode {
     }
 }
 
+/// Codex collaboration mode exposed through the `collaboration_mode` session
+/// configuration option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CollaborationMode {
+    /// Standard Codex execution mode.
+    #[default]
+    Default,
+    /// Plan mode: produce a plan before making direct workspace changes.
+    Plan,
+}
+
+impl CollaborationMode {
+    /// Stable wire identifier for this collaboration mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Plan => "plan",
+        }
+    }
+
+    /// Human-readable display label.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Plan => "Plan",
+        }
+    }
+
+    /// Human-readable description.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Default => "Standard coding mode.",
+            Self::Plan => "Plan changes before implementing them.",
+        }
+    }
+
+    /// All supported [`CollaborationMode`] variants in display order.
+    #[must_use]
+    pub const fn all() -> [Self; 2] {
+        [Self::Default, Self::Plan]
+    }
+
+    /// Parse a `collaboration_mode` option value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodexAcpError::InvalidParams`] if `raw` is not `"default"` or
+    /// `"plan"`.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim() {
+            "default" => Ok(Self::Default),
+            "plan" => Ok(Self::Plan),
+            other => Err(CodexAcpError::InvalidParams(format!(
+                "unsupported `collaboration_mode` value `{other}`; expected `default` or `plan`"
+            ))),
+        }
+    }
+
+    /// Build the `codex app-server` `turn/start` `collaborationMode` payload.
+    ///
+    /// `settings.developer_instructions` is explicitly set to `null` so Codex
+    /// applies the built-in instructions for the selected collaboration mode.
+    #[must_use]
+    pub fn turn_param_json(self, model: Option<&str>, effort: Option<&str>) -> Value {
+        json!({
+            "mode": self.as_str(),
+            "settings": {
+                "model": model.unwrap_or_default(),
+                "reasoning_effort": effort,
+                "developer_instructions": Value::Null,
+            },
+        })
+    }
+}
+
 /// Validate a `reasoning_effort` value.
 ///
 /// # Errors
@@ -266,7 +347,7 @@ fn select_config(
     id: &str,
     name: &str,
     description: &str,
-    category: ConfigCategory,
+    category: Option<ConfigCategory>,
     current: &str,
     entries: Vec<SelectOption>,
 ) -> ConfigOption {
@@ -274,7 +355,7 @@ fn select_config(
         config_id: ConfigId::from_string(id),
         name: name.to_string(),
         description: Some(description.to_string()),
-        category: Some(Open::Known(category)),
+        category: category.map(Open::Known),
         kind: ConfigKind::Select(SelectConfig {
             current_value: ConfigValueId::from_string(current),
             options: SelectOptions::Ungrouped(entries),
@@ -285,7 +366,7 @@ fn select_config(
 }
 
 /// Build the full session [`ConfigOption`] list (`mode`, optional `model`,
-/// `reasoning_effort`, and boolean `fast-mode`).
+/// `reasoning_effort`, boolean `fast-mode`, and `collaboration_mode`).
 #[must_use]
 pub fn build_config_options(
     mode: AcpMode,
@@ -293,6 +374,7 @@ pub fn build_config_options(
     available_models: &[SessionModel],
     effort: Option<&str>,
     fast_mode: bool,
+    collaboration_mode: CollaborationMode,
 ) -> Vec<ConfigOption> {
     let mode_entries = AcpMode::all()
         .into_iter()
@@ -303,7 +385,7 @@ pub fn build_config_options(
         MODE_CONFIG_ID,
         "Mode",
         "Approval and sandboxing preset for the session",
-        ConfigCategory::Mode,
+        Some(ConfigCategory::Mode),
         mode.as_str(),
         mode_entries,
     )];
@@ -323,7 +405,7 @@ pub fn build_config_options(
             MODEL_CONFIG_ID,
             "Model",
             "Model used for the next turn",
-            ConfigCategory::Model,
+            Some(ConfigCategory::Model),
             &selected,
             select_entries,
         ));
@@ -346,7 +428,7 @@ pub fn build_config_options(
         EFFORT_CONFIG_ID,
         "Reasoning effort",
         "Reasoning effort for the next turn",
-        ConfigCategory::ThoughtLevel,
+        Some(ConfigCategory::ThoughtLevel),
         current_effort,
         effort_entries,
     ));
@@ -362,6 +444,19 @@ pub fn build_config_options(
         meta: None,
         extra: BTreeMap::new(),
     });
+
+    let collaboration_entries = CollaborationMode::all()
+        .into_iter()
+        .map(|cm| select_option(cm.as_str(), cm.name(), Some(cm.description())))
+        .collect();
+    options.push(select_config(
+        COLLABORATION_MODE_CONFIG_ID,
+        "Collaboration mode",
+        "Collaboration preset for upcoming turns",
+        None,
+        collaboration_mode.as_str(),
+        collaboration_entries,
+    ));
 
     options
 }
@@ -410,4 +505,80 @@ pub fn build_available_commands() -> Vec<AvailableCommand> {
         })
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collaboration_mode_parse_and_wire_payload() {
+        assert_eq!(
+            CollaborationMode::parse("default").unwrap(),
+            CollaborationMode::Default
+        );
+        assert_eq!(
+            CollaborationMode::parse(" plan ").unwrap(),
+            CollaborationMode::Plan
+        );
+        assert!(matches!(
+            CollaborationMode::parse("invalid"),
+            Err(CodexAcpError::InvalidParams(_))
+        ));
+
+        let payload = CollaborationMode::Plan.turn_param_json(Some("gpt-5.4"), Some("high"));
+        assert_eq!(
+            payload,
+            json!({
+                "mode": "plan",
+                "settings": {
+                    "model": "gpt-5.4",
+                    "reasoning_effort": "high",
+                    "developer_instructions": Value::Null,
+                },
+            })
+        );
+
+        let default_payload = CollaborationMode::Default.turn_param_json(None, None);
+        assert_eq!(
+            default_payload,
+            json!({
+                "mode": "default",
+                "settings": {
+                    "model": "",
+                    "reasoning_effort": Value::Null,
+                    "developer_instructions": Value::Null,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn config_options_include_collaboration_mode() {
+        let opts = build_config_options(
+            AcpMode::ReadOnly,
+            Some("gpt-5.4"),
+            &[],
+            Some("medium"),
+            false,
+            CollaborationMode::Plan,
+        );
+        let collab = opts
+            .iter()
+            .find(|o| o.config_id.as_str() == COLLABORATION_MODE_CONFIG_ID)
+            .expect("collaboration_mode config option missing");
+        assert!(
+            !collab.is_mode(),
+            "collaboration_mode must not collide with mode"
+        );
+        let ConfigKind::Select(select) = &collab.kind else {
+            panic!("expected select config kind, got {:?}", collab.kind);
+        };
+        assert_eq!(select.current_value.as_str(), "plan");
+        let SelectOptions::Ungrouped(entries) = &select.options else {
+            panic!("expected ungrouped select options");
+        };
+        let values: Vec<&str> = entries.iter().map(|e| e.value.as_str()).collect();
+        assert_eq!(values, vec!["default", "plan"]);
+    }
 }

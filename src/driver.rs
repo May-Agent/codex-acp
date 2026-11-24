@@ -62,6 +62,9 @@ impl DriverSlot {
         let poll = driver.as_mut().poll(cx);
         if poll.is_ready() {
             *guard = None;
+            drop(guard);
+            self.bg_wake_tx.close();
+            return Some(poll);
         }
         drop(guard);
         Some(poll)
@@ -118,7 +121,14 @@ impl DriverSlot {
 
             match self.poll_driver_once(cx) {
                 Some(Poll::Ready(())) => Poll::Ready(()),
-                Some(Poll::Pending) | None => Poll::Pending,
+                Some(Poll::Pending) => Poll::Pending,
+                None => {
+                    // Another poller holds the brief synchronous poll lock;
+                    // re-schedule so we do not miss driver completion or waker
+                    // handoff.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
             }
         })
         .await;
@@ -202,5 +212,30 @@ mod tests {
         req_tx.send(reply_tx).await.unwrap();
         assert_eq!(reply_rx.recv().await.unwrap(), 3);
         bg_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_drive_to_completion_callers_both_finish_cleanly() {
+        let (done_tx, done_rx) = async_channel::bounded::<()>(1);
+        let driver = Box::pin(async move {
+            let _ = done_rx.recv().await;
+        });
+        let slot = Arc::new(DriverSlot::new(driver));
+        let slot_a = Arc::clone(&slot);
+        let slot_b = Arc::clone(&slot);
+
+        let task_a = tokio::spawn(async move { slot_a.drive_to_completion().await });
+        let task_b = tokio::spawn(async move { slot_b.drive_to_completion().await });
+
+        futures_lite::future::yield_now().await;
+        let _ = done_tx.send(()).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (a, b) = zip(task_a, task_b).await;
+            a.unwrap();
+            b.unwrap();
+        })
+        .await
+        .expect("both drive_to_completion callers must complete cleanly");
     }
 }
